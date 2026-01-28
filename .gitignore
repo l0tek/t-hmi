@@ -1,0 +1,14 @@
+/target
+/.embuild
+/build
+/dist
+/sdkconfig
+/sdkconfig.old
+/.vscode
+/.idea
+*.log
+*.tmp
+*.swp
+*.swo
+**/*.rs.bk
+.DS_Store

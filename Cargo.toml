@@ -1,0 +1,15 @@
+[package]
+name = "t-hmi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+
+esp-idf-sys = { version = "0.34", features = ["binstart"] }
+esp-idf-hal = "0.43"
+embedded-hal = "0.2"
+embedded-graphics = "0.8"
+
+[build-dependencies]
+embuild = "0.31"
