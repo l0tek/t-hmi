@@ -2,6 +2,7 @@
 /.embuild
 /build
 /dist
+/work
 /sdkconfig
 /sdkconfig.old
 /.vscode

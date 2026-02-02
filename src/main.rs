@@ -12,13 +12,15 @@ use esp_idf_hal::{
 use esp_idf_sys as sys;
 use std::{convert::Infallible, ffi::CString, ptr};
 
-mod ui;
-mod wifi;
+pub mod ui;
+pub mod wifi;
 
 use ui::{
-    clear_screen, draw_bitmap, draw_menu, draw_text_box, draw_wifi_frame, draw_wifi_message,
-    draw_wifi_screen, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, MENU_BTN1_Y, MENU_BTN_H,
-    MENU_BTN_W, MENU_BTN_X,
+    clear_screen, draw_bitmap, draw_menu, draw_text_box, draw_wifi_channel_monitor,
+    draw_wifi_frame, draw_wifi_menu, draw_wifi_message, draw_wifi_monitor, draw_wifi_screen,
+    PacketSample, RssiSeries, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, MENU_BTN1_Y,
+    MENU_BTN_H, MENU_BTN_W, MENU_BTN_X, WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X, WIFI_CH_BTN_RIGHT_X,
+    WIFI_CH_BTN_W, WIFI_CH_BTN_Y, WIFI_MENU_BTN1_Y, WIFI_MENU_BTN2_Y, WIFI_MENU_BTN3_Y,
 };
 
 pub const LCD_H_RES: i32 = 240;
@@ -496,7 +498,98 @@ fn run_calibration(
 
 enum Screen {
     Menu,
+    WifiMenu,
     WifiList,
+    WifiMonitor,
+    WifiChannelMonitor,
+}
+
+struct MonitorSeries {
+    ssid: String,
+    samples: Vec<Option<i8>>,
+    color: Rgb565,
+}
+
+const MONITOR_MAX_SERIES: usize = 3;
+const MONITOR_MAX_SAMPLES: usize = 60;
+const MONITOR_SCAN_INTERVAL_MS: u32 = 2000;
+const RSSI_MIN: i8 = -90;
+const RSSI_MAX: i8 = -30;
+const CHANNEL_MIN: u8 = 1;
+const CHANNEL_MAX: u8 = 13;
+const CHANNEL_SAMPLE_MAX: usize = 60;
+const CHANNEL_SAMPLE_INTERVAL_MS: u32 = 500;
+
+fn update_monitor_series(series: &mut Vec<MonitorSeries>, scan: &[(String, i8)]) {
+    let mut top: Vec<(String, i8)> = scan.to_vec();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    if top.len() > MONITOR_MAX_SERIES {
+        top.truncate(MONITOR_MAX_SERIES);
+    }
+
+    let mut updated = vec![false; series.len()];
+    for (idx, s) in series.iter_mut().enumerate() {
+        if let Some((_, rssi)) = top.iter().find(|(ssid, _)| ssid == &s.ssid) {
+            s.samples.push(Some(*rssi));
+            updated[idx] = true;
+        }
+    }
+
+    for (ssid, rssi) in &top {
+        if series.iter().any(|s| s.ssid == *ssid) {
+            continue;
+        }
+        if series.len() < MONITOR_MAX_SERIES {
+            let color = match series.len() {
+                0 => Rgb565::new(0, 63, 0),
+                1 => Rgb565::new(0, 40, 63),
+                _ => Rgb565::new(63, 20, 0),
+            };
+            series.push(MonitorSeries {
+                ssid: ssid.clone(),
+                samples: vec![Some(*rssi)],
+                color,
+            });
+            updated.push(true);
+        } else if let Some(idx) = series
+            .iter()
+            .position(|s| !top.iter().any(|(t, _)| t == &s.ssid))
+        {
+            let color = series[idx].color;
+            series[idx] = MonitorSeries {
+                ssid: ssid.clone(),
+                samples: vec![Some(*rssi)],
+                color,
+            };
+            if idx < updated.len() {
+                updated[idx] = true;
+            }
+        }
+    }
+
+    for (idx, s) in series.iter_mut().enumerate() {
+        if !updated.get(idx).copied().unwrap_or(false) {
+            s.samples.push(None);
+        }
+        if s.samples.len() > MONITOR_MAX_SAMPLES {
+            let extra = s.samples.len() - MONITOR_MAX_SAMPLES;
+            s.samples.drain(0..extra);
+        }
+    }
+}
+
+fn strongest_channel() -> Result<u8> {
+    let records = wifi::wifi_scan_records()?;
+    if records.is_empty() {
+        return Ok(CHANNEL_MIN);
+    }
+    let mut best = &records[0];
+    for r in &records[1..] {
+        if r.rssi > best.rssi {
+            best = r;
+        }
+    }
+    Ok(best.channel.clamp(CHANNEL_MIN, CHANNEL_MAX))
 }
 
 fn main() -> Result<()> {
@@ -550,6 +643,12 @@ fn main() -> Result<()> {
 
     let mut was_pressed = false;
     let mut screen = Screen::Menu;
+    let mut tick_ms: u32 = 0;
+    let mut monitor_series: Vec<MonitorSeries> = Vec::new();
+    let mut monitor_last_scan: u32 = 0;
+    let mut channel_monitor_channel: u8 = CHANNEL_MIN;
+    let mut channel_monitor_samples: Vec<PacketSample> = Vec::new();
+    let mut channel_monitor_last_sample: u32 = 0;
     loop {
         let raw = touch.read_raw()?;
         let touch_down = raw.is_some();
@@ -567,6 +666,36 @@ fn main() -> Result<()> {
                     && y >= MENU_BTN1_Y
                     && y < MENU_BTN1_Y + MENU_BTN_H;
                 if hit_menu && !was_pressed {
+                    screen = Screen::WifiMenu;
+                    draw_wifi_menu(panel)?;
+                }
+                was_pressed = hit_menu;
+            }
+            Screen::WifiMenu => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                let hit_scan = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= WIFI_MENU_BTN1_Y
+                    && y < WIFI_MENU_BTN1_Y + MENU_BTN_H;
+                let hit_monitor = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= WIFI_MENU_BTN2_Y
+                    && y < WIFI_MENU_BTN2_Y + MENU_BTN_H;
+                let hit_channel = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= WIFI_MENU_BTN3_Y
+                    && y < WIFI_MENU_BTN3_Y + MENU_BTN_H;
+                if hit_back && !was_pressed {
+                    screen = Screen::Menu;
+                    draw_menu(panel)?;
+                } else if hit_scan && !was_pressed {
                     screen = Screen::WifiList;
                     draw_wifi_frame(panel)?;
                     draw_wifi_message(panel, "Scanning...", None)?;
@@ -579,8 +708,25 @@ fn main() -> Result<()> {
                             draw_wifi_message(panel, "Scan error:", Some(&format!("{}", err)))?;
                         }
                     }
+                } else if hit_monitor && !was_pressed {
+                    screen = Screen::WifiMonitor;
+                    monitor_series.clear();
+                    monitor_last_scan = 0;
+                    draw_wifi_monitor(panel, &[], RSSI_MIN, RSSI_MAX)?;
+                } else if hit_channel && !was_pressed {
+                    screen = Screen::WifiChannelMonitor;
+                    channel_monitor_channel = strongest_channel().unwrap_or(CHANNEL_MIN);
+                    channel_monitor_samples.clear();
+                    channel_monitor_last_sample = 0;
+                    let _ = wifi::wifi_monitor_start(channel_monitor_channel);
+                    let _ = wifi::wifi_monitor_take_counts();
+                    draw_wifi_channel_monitor(
+                        panel,
+                        channel_monitor_channel,
+                        &channel_monitor_samples,
+                    )?;
                 }
-                was_pressed = hit_menu;
+                was_pressed = hit_back || hit_scan || hit_monitor || hit_channel;
             }
             Screen::WifiList => {
                 let hit_back = touch_down
@@ -589,12 +735,122 @@ fn main() -> Result<()> {
                     && y >= BACK_BTN_Y
                     && y < BACK_BTN_Y + BACK_BTN_H;
                 if hit_back && !was_pressed {
-                    screen = Screen::Menu;
-                    draw_menu(panel)?;
+                    screen = Screen::WifiMenu;
+                    draw_wifi_menu(panel)?;
                 }
                 was_pressed = hit_back;
             }
+            Screen::WifiMonitor => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                if hit_back && !was_pressed {
+                    screen = Screen::WifiMenu;
+                    draw_wifi_menu(panel)?;
+                } else if tick_ms.wrapping_sub(monitor_last_scan) >= MONITOR_SCAN_INTERVAL_MS {
+                    monitor_last_scan = tick_ms;
+                    match wifi::wifi_scan() {
+                        Ok(items) => {
+                            update_monitor_series(&mut monitor_series, &items);
+                            let series: Vec<RssiSeries> = monitor_series
+                                .iter()
+                                .map(|s| RssiSeries {
+                                    label: s.ssid.as_str(),
+                                    samples: &s.samples,
+                                    color: s.color,
+                                })
+                                .collect();
+                            draw_wifi_monitor(panel, &series, RSSI_MIN, RSSI_MAX)?;
+                        }
+                        Err(err) => {
+                            draw_wifi_monitor(panel, &[], RSSI_MIN, RSSI_MAX)?;
+                            draw_text_box(
+                                panel,
+                                0,
+                                230,
+                                LCD_H_RES,
+                                24,
+                                &format!("Scan error: {}", err),
+                                Rgb565::new(63, 0, 0),
+                                Rgb565::BLACK,
+                            )?;
+                        }
+                    }
+                }
+                was_pressed = hit_back;
+            }
+            Screen::WifiChannelMonitor => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                let hit_prev = touch_down
+                    && x >= WIFI_CH_BTN_LEFT_X
+                    && x < WIFI_CH_BTN_LEFT_X + WIFI_CH_BTN_W
+                    && y >= WIFI_CH_BTN_Y
+                    && y < WIFI_CH_BTN_Y + WIFI_CH_BTN_H;
+                let hit_next = touch_down
+                    && x >= WIFI_CH_BTN_RIGHT_X
+                    && x < WIFI_CH_BTN_RIGHT_X + WIFI_CH_BTN_W
+                    && y >= WIFI_CH_BTN_Y
+                    && y < WIFI_CH_BTN_Y + WIFI_CH_BTN_H;
+                if hit_back && !was_pressed {
+                    let _ = wifi::wifi_monitor_stop();
+                    screen = Screen::WifiMenu;
+                    draw_wifi_menu(panel)?;
+                } else if hit_prev && !was_pressed {
+                    if channel_monitor_channel > CHANNEL_MIN {
+                        channel_monitor_channel -= 1;
+                    }
+                    channel_monitor_samples.clear();
+                    channel_monitor_last_sample = 0;
+                    let _ = wifi::wifi_monitor_start(channel_monitor_channel);
+                    let _ = wifi::wifi_monitor_take_counts();
+                    draw_wifi_channel_monitor(
+                        panel,
+                        channel_monitor_channel,
+                        &channel_monitor_samples,
+                    )?;
+                } else if hit_next && !was_pressed {
+                    if channel_monitor_channel < CHANNEL_MAX {
+                        channel_monitor_channel += 1;
+                    }
+                    channel_monitor_samples.clear();
+                    channel_monitor_last_sample = 0;
+                    let _ = wifi::wifi_monitor_start(channel_monitor_channel);
+                    let _ = wifi::wifi_monitor_take_counts();
+                    draw_wifi_channel_monitor(
+                        panel,
+                        channel_monitor_channel,
+                        &channel_monitor_samples,
+                    )?;
+                } else if tick_ms.wrapping_sub(channel_monitor_last_sample)
+                    >= CHANNEL_SAMPLE_INTERVAL_MS
+                {
+                    channel_monitor_last_sample = tick_ms;
+                    let count = wifi::wifi_monitor_take_counts();
+                    channel_monitor_samples.push(PacketSample {
+                        mgmt: count.mgmt,
+                        data: count.data,
+                        ctrl: count.ctrl,
+                    });
+                    if channel_monitor_samples.len() > CHANNEL_SAMPLE_MAX {
+                        let extra = channel_monitor_samples.len() - CHANNEL_SAMPLE_MAX;
+                        channel_monitor_samples.drain(0..extra);
+                    }
+                    draw_wifi_channel_monitor(
+                        panel,
+                        channel_monitor_channel,
+                        &channel_monitor_samples,
+                    )?;
+                }
+                was_pressed = hit_back || hit_prev || hit_next;
+            }
         }
         FreeRtos::delay_ms(20);
+        tick_ms = tick_ms.wrapping_add(20);
     }
 }
