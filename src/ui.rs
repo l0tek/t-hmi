@@ -41,6 +41,63 @@ const CHANNEL_BAR_H: i32 = 170;
 const ICON_W: i32 = 16;
 const ICON_H: i32 = 16;
 
+const ICON_GPS: [u16; 16] = [
+    0b0000000000000000,
+    0b0000001110000000,
+    0b0000011111000000,
+    0b0000111111100000,
+    0b0001110001110000,
+    0b0001100000110000,
+    0b0001100010110000,
+    0b0001100000110000,
+    0b0001110001110000,
+    0b0000111111100000,
+    0b0000011111000000,
+    0b0000001110000000,
+    0b0000000100000000,
+    0b0000000100000000,
+    0b0000001000000000,
+    0b0000010000000000,
+];
+
+const ICON_DEVICE: [u16; 16] = [
+    0b0000000000000000,
+    0b0000011111100000,
+    0b0001111111111000,
+    0b0010000000000100,
+    0b0010111111100100,
+    0b0010100000100100,
+    0b0010101110100100,
+    0b0010101110100100,
+    0b0010100000100100,
+    0b0010111111100100,
+    0b0010000000000100,
+    0b0001111111111000,
+    0b0000011111100000,
+    0b0000001000010000,
+    0b0000000000000000,
+    0b0000000000000000,
+];
+
+const ICON_REBOOT: [u16; 16] = [
+    0b0000000111010000,
+    0b0000001111110000,
+    0b0000011101111000,
+    0b0000111000111000,
+    0b0001110000011100,
+    0b0011100000001110,
+    0b0011100000001110,
+    0b0011100000001110,
+    0b0001110000011100,
+    0b0000111000111000,
+    0b0000011101110000,
+    0b0000001111100000,
+    0b0000000111000000,
+    0b0000000000000000,
+    0b0000000000000000,
+    0b0000000000000000,
+];
+
 pub fn draw_bitmap(
     panel: sys::esp_lcd_panel_handle_t,
     x: i32,
@@ -145,6 +202,9 @@ pub fn draw_rect_box(
 }
 
 pub fn draw_header(panel: sys::esp_lcd_panel_handle_t, title: &str, show_back: bool) -> Result<()> {
+    let header_bg = Rgb565::new(24, 48, 24);
+    let header_fg = Rgb565::BLACK;
+    let header_border = Rgb565::BLACK;
     draw_rect_box(
         panel,
         0,
@@ -152,8 +212,8 @@ pub fn draw_header(panel: sys::esp_lcd_panel_handle_t, title: &str, show_back: b
         LCD_H_RES,
         HEADER_H,
         2,
-        Rgb565::new(0, 63, 0),
-        Rgb565::BLACK,
+        header_border,
+        header_bg,
         None,
     )?;
     let title_x = if show_back {
@@ -164,8 +224,8 @@ pub fn draw_header(panel: sys::esp_lcd_panel_handle_t, title: &str, show_back: b
             BACK_BTN_W,
             BACK_BTN_H,
             2,
-            Rgb565::new(0, 63, 0),
-            Rgb565::BLACK,
+            header_border,
+            header_bg,
             Some("< Back"),
         )?;
         BACK_BTN_X + BACK_BTN_W + 6
@@ -176,37 +236,27 @@ pub fn draw_header(panel: sys::esp_lcd_panel_handle_t, title: &str, show_back: b
     let title_y = 3;
     let title_h = 24;
     draw_text_box(
-        panel,
-        title_x,
-        title_y,
-        title_w,
-        title_h,
-        title,
-        Rgb565::new(0, 63, 0),
-        Rgb565::BLACK,
+        panel, title_x, title_y, title_w, title_h, title, header_fg, header_bg,
     )?;
     Ok(())
 }
 
-fn draw_icon(
-    panel: sys::esp_lcd_panel_handle_t,
-    x: i32,
-    y: i32,
-    fg: Rgb565,
-    bg: Rgb565,
-    rows: &[u16],
-) -> Result<()> {
-    let mut buffer = vec![bg.into_storage(); (ICON_W * ICON_H) as usize];
+fn draw_icon_fb(fb: &mut FrameBuffer, x: i32, y: i32, fg: Rgb565, rows: &[u16]) -> Result<()> {
     for (yy, row) in rows.iter().enumerate() {
         for xx in 0..ICON_W {
             let bit = 1u16 << (ICON_W - 1 - xx);
             if (row & bit) != 0 {
-                let idx = (yy as i32 * ICON_W + xx) as usize;
-                buffer[idx] = fg.into_storage();
+                let px = x + xx;
+                let py = y + yy as i32;
+                if px < 0 || py < 0 || px >= fb.width || py >= fb.height {
+                    continue;
+                }
+                let idx = (py as usize * fb.width as usize) + px as usize;
+                fb.data[idx] = fg.into_storage();
             }
         }
     }
-    draw_bitmap(panel, x, y, ICON_W, ICON_H, &buffer)
+    Ok(())
 }
 
 fn draw_wifi_icon(fb: &mut FrameBuffer, x: i32, y: i32, fg: Rgb565, bg: Rgb565) -> Result<()> {
@@ -321,6 +371,18 @@ fn draw_menu_line(
                 draw_radar_icon(&mut fb, x, icon_y, fg)?;
                 x += ICON_W + 4;
             }
+            'ᚷ' => {
+                draw_icon_fb(&mut fb, x, icon_y, fg, &ICON_GPS)?;
+                x += ICON_W + 4;
+            }
+            'ᛞ' => {
+                draw_icon_fb(&mut fb, x, icon_y, fg, &ICON_DEVICE)?;
+                x += ICON_W + 4;
+            }
+            'ᚲ' => {
+                draw_icon_fb(&mut fb, x, icon_y, fg, &ICON_REBOOT)?;
+                x += ICON_W + 4;
+            }
             ' ' => {
                 x += FONT_10X20.character_size.width as i32;
             }
@@ -343,10 +405,18 @@ pub fn draw_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
     let fg = Rgb565::new(0, 63, 0);
     draw_menu_line(panel, MENU_BTN1_Y, "ᯤ WiFi", fg, Rgb565::BLACK)?;
     draw_menu_line(panel, MENU_BTN2_Y, "ᛒ Bluetooth", fg, Rgb565::BLACK)?;
+    draw_menu_line(panel, MENU_BTN2_Y + MENU_BTN_H, "ᚷ GPS", fg, Rgb565::BLACK)?;
     draw_menu_line(
         panel,
-        MENU_BTN2_Y + MENU_BTN_H,
-        "  Device",
+        MENU_BTN2_Y + (MENU_BTN_H * 2),
+        "ᛞ Device",
+        fg,
+        Rgb565::BLACK,
+    )?;
+    draw_menu_line(
+        panel,
+        MENU_BTN2_Y + (MENU_BTN_H * 3),
+        "ᚲ Reboot",
         fg,
         Rgb565::BLACK,
     )?;
