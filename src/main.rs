@@ -12,13 +12,18 @@ use esp_idf_hal::{
 use esp_idf_sys as sys;
 use std::{convert::Infallible, ffi::CString, ptr};
 
+pub mod device;
+pub mod gps;
 pub mod ui;
 pub mod wifi;
 
+use device::read_battery_once;
 use ui::{
-    clear_screen, draw_bitmap, draw_menu, draw_text_box, draw_wifi_channel_monitor,
+    clear_screen, draw_battery_status_frame, draw_battery_status_values, draw_battery_unavailable,
+    draw_bitmap, draw_device_menu, draw_menu, draw_text_box, draw_wifi_channel_monitor,
     draw_wifi_frame, draw_wifi_menu, draw_wifi_message, draw_wifi_monitor, draw_wifi_screen,
-    PacketSample, RssiSeries, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, MENU_BTN1_Y,
+    BatteryLabels, PacketSample, RssiSeries, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y,
+    DEVICE_MENU_BTN1_Y, DEVICE_MENU_BTN2_Y, DEVICE_MENU_BTN3_Y, MENU_BTN1_Y, MENU_BTN2_Y,
     MENU_BTN_H, MENU_BTN_W, MENU_BTN_X, WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X, WIFI_CH_BTN_RIGHT_X,
     WIFI_CH_BTN_W, WIFI_CH_BTN_Y, WIFI_MENU_BTN1_Y, WIFI_MENU_BTN2_Y, WIFI_MENU_BTN3_Y,
 };
@@ -36,6 +41,29 @@ const TOUCH_MISO: i32 = 4;
 const TOUCH_MOSI: i32 = 3;
 const TOUCH_CS: i32 = 2;
 const TOUCH_IRQ: i32 = 9;
+// BAT_ADC shares IO03 with LCD_MOSI/Touch MOSI on this board.
+// We only read at boot and when entering the BatteryStatus screen.
+const BAT_ADC_GPIO: i32 = 3;
+const PWR_EN_GPIO: i32 = 10;
+const PWR_ON_GPIO: i32 = 14;
+const BL_GPIO: i32 = 38;
+// External/reed switch input; Arduino example treats it as active-high.
+const POWER_BTN_GPIO: i32 = 21;
+const POWER_BTN_DEBOUNCE_MS: u32 = 40;
+
+fn enter_deep_sleep() -> ! {
+    unsafe {
+        sys::gpio_hold_en(PWR_ON_GPIO);
+        sys::gpio_hold_en(PWR_EN_GPIO);
+        sys::gpio_hold_en(BL_GPIO);
+        sys::gpio_deep_sleep_hold_en();
+        sys::esp_sleep_enable_ext0_wakeup(POWER_BTN_GPIO, 1);
+    }
+    unsafe { sys::esp_deep_sleep_start() };
+    loop {
+        FreeRtos::delay_ms(1000);
+    }
+}
 
 pub fn esp_ok(code: sys::esp_err_t) -> Result<()> {
     if code == sys::ESP_OK {
@@ -502,6 +530,10 @@ enum Screen {
     WifiList,
     WifiMonitor,
     WifiChannelMonitor,
+    Gps,
+    UartLoopback,
+    DeviceMenu,
+    BatteryStatus,
 }
 
 struct MonitorSeries {
@@ -601,9 +633,18 @@ fn main() -> Result<()> {
     let mut pwr_en = PinDriver::output(p.pins.gpio10)?;
     let mut pwr_on = PinDriver::output(p.pins.gpio14)?;
     let mut bl = PinDriver::output(p.pins.gpio38)?;
+    let mut power_btn = PinDriver::input(unsafe { AnyIOPin::new(POWER_BTN_GPIO) })?;
     pwr_en.set_high()?;
     pwr_on.set_high()?;
     bl.set_high()?;
+    power_btn.set_pull(Pull::Down)?;
+
+    // Read battery before LCD init since BAT_ADC shares IO03 with LCD_MOSI.
+    let mut battery_cache = if BAT_ADC_GPIO >= 0 {
+        read_battery_once(BAT_ADC_GPIO).ok()
+    } else {
+        None
+    };
 
     let panel = init_lcd()?;
 
@@ -640,6 +681,8 @@ fn main() -> Result<()> {
         }
     };
     let calibration = Calibration::from_points(&points);
+    let mut touch = Some(touch);
+    let mut gps_reader = gps::GpsReader::new(p.uart1, p.pins.gpio16, p.pins.gpio15)?;
 
     let mut was_pressed = false;
     let mut screen = Screen::Menu;
@@ -649,8 +692,29 @@ fn main() -> Result<()> {
     let mut channel_monitor_channel: u8 = CHANNEL_MIN;
     let mut channel_monitor_samples: Vec<PacketSample> = Vec::new();
     let mut channel_monitor_last_sample: u32 = 0;
+    let mut power_btn_last_raw = power_btn.is_high();
+    let mut battery_last_read: u32 = 0;
+    let mut battery_ignore_back_until: u32 = 0;
+    let mut battery_ignore_back = false;
+    let mut battery_labels: Option<BatteryLabels> = None;
+    let mut gps_last_redraw: u32 = 0;
+    let mut gps_back_to_device = false;
+    let mut loopback_last_redraw: u32 = 0;
     loop {
-        let raw = touch.read_raw()?;
+        let power_btn_raw = power_btn.is_high();
+        if power_btn_raw && !power_btn_last_raw {
+            bl.set_low()?;
+            pwr_on.set_high()?;
+            pwr_en.set_high()?;
+            enter_deep_sleep();
+        }
+        power_btn_last_raw = power_btn_raw;
+
+        let raw = if let Some(t) = touch.as_mut() {
+            t.read_raw()?
+        } else {
+            None
+        };
         let touch_down = raw.is_some();
         let (x, y) = if let Some(raw) = raw {
             calibration.map(raw.raw_x, raw.raw_y)
@@ -665,11 +729,30 @@ fn main() -> Result<()> {
                     && x < MENU_BTN_X + MENU_BTN_W
                     && y >= MENU_BTN1_Y
                     && y < MENU_BTN1_Y + MENU_BTN_H;
+                let hit_device = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= MENU_BTN2_Y + (MENU_BTN_H * 2)
+                    && y < MENU_BTN2_Y + (MENU_BTN_H * 2) + MENU_BTN_H;
+                let hit_gps = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= MENU_BTN2_Y + MENU_BTN_H
+                    && y < MENU_BTN2_Y + (MENU_BTN_H * 2);
                 if hit_menu && !was_pressed {
                     screen = Screen::WifiMenu;
                     draw_wifi_menu(panel)?;
+                } else if hit_gps && !was_pressed {
+                    screen = Screen::Gps;
+                    gps_back_to_device = false;
+                    gps_last_redraw = tick_ms;
+                    gps::draw_gps_frame(panel)?;
+                    gps::draw_gps_values(panel, &gps_reader)?;
+                } else if hit_device && !was_pressed {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
                 }
-                was_pressed = hit_menu;
+                was_pressed = hit_menu || hit_gps || hit_device;
             }
             Screen::WifiMenu => {
                 let hit_back = touch_down
@@ -848,6 +931,121 @@ fn main() -> Result<()> {
                     )?;
                 }
                 was_pressed = hit_back || hit_prev || hit_next;
+            }
+            Screen::DeviceMenu => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                let hit_batt = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= DEVICE_MENU_BTN1_Y
+                    && y < DEVICE_MENU_BTN1_Y + MENU_BTN_H;
+                let hit_gps = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= DEVICE_MENU_BTN2_Y
+                    && y < DEVICE_MENU_BTN2_Y + MENU_BTN_H;
+                let hit_loopback = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= DEVICE_MENU_BTN3_Y
+                    && y < DEVICE_MENU_BTN3_Y + MENU_BTN_H;
+                if hit_back && !was_pressed {
+                    screen = Screen::Menu;
+                    draw_menu(panel)?;
+                } else if hit_batt && !was_pressed {
+                    screen = Screen::BatteryStatus;
+                    battery_last_read = 0;
+                    battery_ignore_back_until = tick_ms.wrapping_add(1200);
+                    battery_ignore_back = true;
+                    battery_labels = Some(draw_battery_status_frame(panel)?);
+                } else if hit_gps && !was_pressed {
+                    screen = Screen::Gps;
+                    gps_back_to_device = true;
+                    gps_last_redraw = tick_ms;
+                    gps::draw_gps_frame(panel)?;
+                    gps::draw_gps_values(panel, &gps_reader)?;
+                } else if hit_loopback && !was_pressed {
+                    screen = Screen::UartLoopback;
+                    gps_reader.loopback_reset();
+                    loopback_last_redraw = tick_ms;
+                    gps::draw_uart_loopback_frame(panel)?;
+                    gps::draw_uart_loopback_values(panel, &gps_reader)?;
+                }
+                was_pressed = hit_back || hit_batt || hit_gps || hit_loopback;
+            }
+            Screen::Gps => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                if hit_back && !was_pressed {
+                    if gps_back_to_device {
+                        screen = Screen::DeviceMenu;
+                        draw_device_menu(panel)?;
+                    } else {
+                        screen = Screen::Menu;
+                        draw_menu(panel)?;
+                    }
+                } else {
+                    let gps_changed = gps_reader.poll(tick_ms)?;
+                    if gps_changed || tick_ms.wrapping_sub(gps_last_redraw) >= 300 {
+                        gps::draw_gps_values(panel, &gps_reader)?;
+                        gps_last_redraw = tick_ms;
+                    }
+                }
+                was_pressed = hit_back;
+            }
+            Screen::UartLoopback => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                if hit_back && !was_pressed {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
+                } else {
+                    let changed = gps_reader.loopback_poll(tick_ms)?;
+                    if changed || tick_ms.wrapping_sub(loopback_last_redraw) >= 300 {
+                        gps::draw_uart_loopback_values(panel, &gps_reader)?;
+                        loopback_last_redraw = tick_ms;
+                    }
+                }
+                was_pressed = hit_back;
+            }
+            Screen::BatteryStatus => {
+                if battery_ignore_back && !touch_down {
+                    battery_ignore_back = false;
+                }
+                let ignore_back = battery_ignore_back
+                    || battery_ignore_back_until.wrapping_sub(tick_ms) < 0x8000_0000;
+                let hit_back = !ignore_back
+                    && touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                if hit_back && !was_pressed {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
+                    battery_labels = None;
+                } else if battery_cache.is_none() {
+                    if battery_last_read == 0 {
+                        draw_battery_unavailable(panel, "ADC disabled/NA")?;
+                        battery_last_read = tick_ms;
+                    }
+                } else if battery_last_read == 0 {
+                    if let (Some(labels), Some(status)) = (&battery_labels, &battery_cache) {
+                        draw_battery_status_values(panel, labels, status)?;
+                    }
+                    battery_last_read = tick_ms;
+                }
+                was_pressed = hit_back;
             }
         }
         FreeRtos::delay_ms(20);

@@ -23,6 +23,9 @@ pub const HEADER_H: i32 = 30;
 pub const WIFI_MENU_BTN1_Y: i32 = 60;
 pub const WIFI_MENU_BTN2_Y: i32 = 100;
 pub const WIFI_MENU_BTN3_Y: i32 = 140;
+pub const DEVICE_MENU_BTN1_Y: i32 = 60;
+pub const DEVICE_MENU_BTN2_Y: i32 = 100;
+pub const DEVICE_MENU_BTN3_Y: i32 = 140;
 pub const WIFI_CH_BTN_W: i32 = 28;
 pub const WIFI_CH_BTN_H: i32 = 22;
 pub const WIFI_CH_BTN_Y: i32 = LCD_V_RES - 28;
@@ -97,6 +100,33 @@ const ICON_REBOOT: [u16; 16] = [
     0b0000000000000000,
     0b0000000000000000,
 ];
+
+const ICON_BATTERY: [u16; 16] = [
+    0b0000000000000000,
+    0b0000001111110000,
+    0b0000010000010000,
+    0b0000110000011000,
+    0b0000110000011000,
+    0b0000110000011000,
+    0b0000110000011000,
+    0b0000110000011000,
+    0b0000110000011000,
+    0b0000110000011000,
+    0b0000110000011000,
+    0b0000110000011000,
+    0b0000010000010000,
+    0b0000001111110000,
+    0b0000000000000000,
+    0b0000000000000000,
+];
+
+pub struct BatteryLabels {
+    pub y_vbat: i32,
+    pub y_adc: i32,
+    pub y_raw: i32,
+    pub y_soc: i32,
+    pub y_cal: i32,
+}
 
 pub fn draw_bitmap(
     panel: sys::esp_lcd_panel_handle_t,
@@ -239,6 +269,25 @@ pub fn draw_header(panel: sys::esp_lcd_panel_handle_t, title: &str, show_back: b
         panel, title_x, title_y, title_w, title_h, title, header_fg, header_bg,
     )?;
     Ok(())
+}
+
+pub fn draw_header_with_icon(
+    panel: sys::esp_lcd_panel_handle_t,
+    title: &str,
+    show_back: bool,
+    icon: &[u16; 16],
+) -> Result<()> {
+    draw_header(panel, title, show_back)?;
+    let icon_x = LCD_H_RES - ICON_W - 6;
+    let icon_y = 7;
+    let mut buffer = vec![Rgb565::new(24, 48, 24).into_storage(); (ICON_W * ICON_H) as usize];
+    let mut fb = FrameBuffer {
+        width: ICON_W,
+        height: ICON_H,
+        data: &mut buffer,
+    };
+    draw_icon_fb(&mut fb, 0, 0, Rgb565::BLACK, icon)?;
+    draw_bitmap(panel, icon_x, icon_y, ICON_W, ICON_H, &buffer)
 }
 
 fn draw_icon_fb(fb: &mut FrameBuffer, x: i32, y: i32, fg: Rgb565, rows: &[u16]) -> Result<()> {
@@ -418,6 +467,148 @@ pub fn draw_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
         MENU_BTN2_Y + (MENU_BTN_H * 3),
         "ᚲ Reboot",
         fg,
+        Rgb565::BLACK,
+    )?;
+    Ok(())
+}
+
+pub fn draw_device_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
+    clear_screen(panel, Rgb565::BLACK)?;
+    draw_header(panel, "Device", true)?;
+    draw_menu_line(
+        panel,
+        DEVICE_MENU_BTN1_Y,
+        "  Batteriestatus",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_menu_line(
+        panel,
+        DEVICE_MENU_BTN2_Y,
+        "ᚷ GPS",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_menu_line(
+        panel,
+        DEVICE_MENU_BTN3_Y,
+        "  UART Loopback",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    Ok(())
+}
+
+pub fn draw_battery_status_frame(panel: sys::esp_lcd_panel_handle_t) -> Result<BatteryLabels> {
+    clear_screen(panel, Rgb565::BLACK)?;
+    draw_header_with_icon(panel, "Batteriestatus", true, &ICON_BATTERY)?;
+
+    let fg = Rgb565::new(0, 63, 0);
+    let mut y = 50;
+    let line_h = 20;
+    draw_text_box(panel, 0, y, LCD_H_RES, line_h, "VBAT:", fg, Rgb565::BLACK)?;
+    let y_vbat = y;
+    y += line_h;
+    draw_text_box(panel, 0, y, LCD_H_RES, line_h, "ADC:", fg, Rgb565::BLACK)?;
+    let y_adc = y;
+    y += line_h;
+    draw_text_box(panel, 0, y, LCD_H_RES, line_h, "RAW:", fg, Rgb565::BLACK)?;
+    let y_raw = y;
+    y += line_h;
+    draw_text_box(panel, 0, y, LCD_H_RES, line_h, "SoC:", fg, Rgb565::BLACK)?;
+    let y_soc = y;
+    y += line_h;
+    draw_text_box_small(panel, 0, y, LCD_H_RES, 12, "Cal:", fg, Rgb565::BLACK)?;
+    let y_cal = y;
+
+    Ok(BatteryLabels {
+        y_vbat,
+        y_adc,
+        y_raw,
+        y_soc,
+        y_cal,
+    })
+}
+
+pub fn draw_battery_status_values(
+    panel: sys::esp_lcd_panel_handle_t,
+    labels: &BatteryLabels,
+    status: &crate::device::BatteryStatus,
+) -> Result<()> {
+    let fg = Rgb565::new(0, 63, 0);
+    draw_text_box(
+        panel,
+        70,
+        labels.y_vbat,
+        LCD_H_RES - 70,
+        20,
+        &format!("{} mV", status.v_bat_mv),
+        fg,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        70,
+        labels.y_adc,
+        LCD_H_RES - 70,
+        20,
+        &format!("{} mV", status.v_adc_mv),
+        fg,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        70,
+        labels.y_raw,
+        LCD_H_RES - 70,
+        20,
+        &format!("{}", status.raw),
+        fg,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        70,
+        labels.y_soc,
+        LCD_H_RES - 70,
+        20,
+        &format!("{} %", status.percent),
+        fg,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        70,
+        labels.y_cal,
+        LCD_H_RES - 70,
+        12,
+        if status.calibrated { "yes" } else { "no" },
+        fg,
+        Rgb565::BLACK,
+    )?;
+    Ok(())
+}
+
+pub fn draw_battery_unavailable(panel: sys::esp_lcd_panel_handle_t, reason: &str) -> Result<()> {
+    let _ = draw_battery_status_frame(panel)?;
+    draw_text_box(
+        panel,
+        0,
+        80,
+        LCD_H_RES,
+        24,
+        "Battery ADC",
+        Rgb565::new(63, 0, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        108,
+        LCD_H_RES,
+        12,
+        reason,
+        Rgb565::new(63, 0, 0),
         Rgb565::BLACK,
     )?;
     Ok(())
