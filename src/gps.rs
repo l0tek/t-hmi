@@ -16,6 +16,9 @@ use crate::{
 const GPS_BAUDRATE: u32 = 9_600;
 const GPS_BAUD_CANDIDATES: [u32; 3] = [9_600, 38_400, 115_200];
 const GPS_BAUD_SCAN_INTERVAL_MS: u32 = 1_800;
+const HOST_LOG_INTERVAL_MS: u32 = 300;
+const HOST_RAW_LOW_BPS: u32 = 40;
+const HOST_NO_NMEA_WARN_MS: u32 = 5_000;
 const NMEA_BUF_MAX: usize = 160;
 const RAW_RECENT_MAX: usize = 24;
 const GPS_LINE_W: i32 = LCD_H_RES;
@@ -38,7 +41,13 @@ pub struct GpsReader<'d> {
     raw_bytes_per_sec: u32,
     raw_window_start_ms: u32,
     last_baud_switch_ms: u32,
+    last_host_log_ms: u32,
+    last_nmea_ms: u32,
+    last_raw_rx_ms: u32,
+    host_log_enabled: bool,
     has_valid_nmea: bool,
+    total_nmea: u32,
+    total_non_nmea_lines: u32,
     lb_tx_ok: u32,
     lb_rx_ok: u32,
     lb_rx_err: u32,
@@ -78,7 +87,13 @@ impl<'d> GpsReader<'d> {
             raw_bytes_per_sec: 0,
             raw_window_start_ms: 0,
             last_baud_switch_ms: 0,
+            last_host_log_ms: 0,
+            last_nmea_ms: 0,
+            last_raw_rx_ms: 0,
+            host_log_enabled: false,
             has_valid_nmea: false,
+            total_nmea: 0,
+            total_non_nmea_lines: 0,
             lb_tx_ok: 0,
             lb_rx_ok: 0,
             lb_rx_err: 0,
@@ -102,6 +117,7 @@ impl<'d> GpsReader<'d> {
         let read = self.uart.read(&mut tmp, NON_BLOCK)?;
         if read > 0 {
             self.raw_bytes_acc = self.raw_bytes_acc.saturating_add(read as u32);
+            self.last_raw_rx_ms = now_ms;
             self.raw_recent.extend_from_slice(&tmp[..read]);
             if self.raw_recent.len() > RAW_RECENT_MAX {
                 let extra = self.raw_recent.len() - RAW_RECENT_MAX;
@@ -119,7 +135,13 @@ impl<'d> GpsReader<'d> {
                     if !self.line_buf.is_empty() {
                         let line = String::from_utf8_lossy(&self.line_buf).to_string();
                         let was_valid = self.has_valid_nmea;
-                        self.handle_sentence(&line);
+                        let is_nmea = self.handle_sentence(&line);
+                        if is_nmea {
+                            self.total_nmea = self.total_nmea.saturating_add(1);
+                            self.last_nmea_ms = now_ms;
+                        } else {
+                            self.total_non_nmea_lines = self.total_non_nmea_lines.saturating_add(1);
+                        }
                         self.line_buf.clear();
                         if self.has_valid_nmea && !was_valid {
                             self.last_sentence =
@@ -156,6 +178,14 @@ impl<'d> GpsReader<'d> {
             changed = true;
         }
 
+        if self.host_log_enabled
+            && (self.last_host_log_ms == 0
+                || now_ms.wrapping_sub(self.last_host_log_ms) >= HOST_LOG_INTERVAL_MS)
+        {
+            self.print_host_diagnostics(now_ms);
+            self.last_host_log_ms = now_ms;
+        }
+
         Ok(changed)
     }
 
@@ -168,9 +198,9 @@ impl<'d> GpsReader<'d> {
         Ok(())
     }
 
-    fn handle_sentence(&mut self, sentence: &str) {
+    fn handle_sentence(&mut self, sentence: &str) -> bool {
         if !sentence.starts_with('$') {
-            return;
+            return false;
         }
 
         self.has_valid_nmea = true;
@@ -180,7 +210,7 @@ impl<'d> GpsReader<'d> {
         let sentence_wo_checksum = sentence.split('*').next().unwrap_or(sentence);
         let parts: Vec<&str> = sentence_wo_checksum.split(',').collect();
         if parts.is_empty() {
-            return;
+            return false;
         }
 
         match parts[0] {
@@ -201,10 +231,81 @@ impl<'d> GpsReader<'d> {
             }
             _ => {}
         }
+        true
+    }
+
+    fn print_host_diagnostics(&self, now_ms: u32) {
+        let mode = if self.auto_scan_active() {
+            "scan"
+        } else {
+            "lock"
+        };
+        let sats = self
+            .sats()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let lat = self
+            .lat()
+            .map(|v| format!("{:.6}", v))
+            .unwrap_or_else(|| "-".to_string());
+        let lon = self
+            .lon()
+            .map(|v| format!("{:.6}", v))
+            .unwrap_or_else(|| "-".to_string());
+
+        let mut analysis = Vec::<&str>::new();
+        if self.auto_scan_active()
+            && now_ms.wrapping_sub(self.last_nmea_ms.max(self.last_baud_switch_ms))
+                >= HOST_NO_NMEA_WARN_MS
+        {
+            analysis.push("NO_NMEA_LOCK");
+        }
+        if now_ms.wrapping_sub(self.last_raw_rx_ms) >= 2_000 {
+            analysis.push("NO_UART_RX");
+        } else if self.raw_bytes_per_sec < HOST_RAW_LOW_BPS {
+            analysis.push("LOW_RAW_BPS");
+        }
+        if self.has_valid_nmea && !self.fix {
+            analysis.push("NMEA_NO_FIX");
+        }
+        if self.fix && self.sats.unwrap_or(0) < 4 {
+            analysis.push("LOW_SATS");
+        }
+        if self.fix && (self.lat.is_none() || self.lon.is_none()) {
+            analysis.push("NO_COORDS");
+        }
+        let analysis = if analysis.is_empty() {
+            "OK".to_string()
+        } else {
+            analysis.join("|")
+        };
+
+        let last = self.last_sentence.chars().take(28).collect::<String>();
+        println!(
+            "[GPS] baud={} mode={} raw_bps={} fix={} sats={} lat={} lon={} nmea={} non_nmea={} last=\"{}\" analysis={}",
+            self.current_baud(),
+            mode,
+            self.raw_bytes_per_sec(),
+            if self.fix() { "Y" } else { "N" },
+            sats,
+            lat,
+            lon,
+            self.total_nmea,
+            self.total_non_nmea_lines,
+            last,
+            analysis
+        );
     }
 
     pub fn fix(&self) -> bool {
         self.fix
+    }
+
+    pub fn set_host_log_enabled(&mut self, enabled: bool) {
+        self.host_log_enabled = enabled;
+        if enabled {
+            self.last_host_log_ms = 0;
+        }
     }
 
     pub fn sats(&self) -> Option<u8> {

@@ -746,6 +746,7 @@ fn main() -> Result<()> {
                     screen = Screen::Gps;
                     gps_back_to_device = false;
                     gps_last_redraw = tick_ms;
+                    gps_reader.set_host_log_enabled(false);
                     gps::draw_gps_frame(panel)?;
                     gps::draw_gps_values(panel, &gps_reader)?;
                 } else if hit_device && !was_pressed {
@@ -966,10 +967,12 @@ fn main() -> Result<()> {
                     screen = Screen::Gps;
                     gps_back_to_device = true;
                     gps_last_redraw = tick_ms;
+                    gps_reader.set_host_log_enabled(true);
                     gps::draw_gps_frame(panel)?;
                     gps::draw_gps_values(panel, &gps_reader)?;
                 } else if hit_loopback && !was_pressed {
                     screen = Screen::UartLoopback;
+                    gps_reader.set_host_log_enabled(false);
                     gps_reader.loopback_reset();
                     loopback_last_redraw = tick_ms;
                     gps::draw_uart_loopback_frame(panel)?;
@@ -984,6 +987,7 @@ fn main() -> Result<()> {
                     && y >= BACK_BTN_Y
                     && y < BACK_BTN_Y + BACK_BTN_H;
                 if hit_back && !was_pressed {
+                    gps_reader.set_host_log_enabled(false);
                     if gps_back_to_device {
                         screen = Screen::DeviceMenu;
                         draw_device_menu(panel)?;

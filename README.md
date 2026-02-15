@@ -16,6 +16,22 @@ cargo build
 cargo run
 ```
 
+## Host Logging (without `cargo run`)
+If firmware is already flashed, you can read logs directly from the serial port:
+
+```bash
+ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
+tio /dev/ttyACM0 -b 115200
+```
+
+Optional: show only GPS diagnostics
+
+```bash
+tio /dev/ttyACM0 -b 115200 | stdbuf -oL grep '^\[GPS\]'
+```
+
+GPS host logs are only enabled while the UI is on `Device -> GPS`.
+
 ## Project Structure
 - `src/main.rs`: Application entry point
 - `src/ui.rs`: UI/HMI rendering and interaction logic
