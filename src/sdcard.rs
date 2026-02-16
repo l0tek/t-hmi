@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use esp_idf_sys as sys;
-use std::{ffi::CString, ptr};
+use std::{ffi::CString, fs, ptr};
 
 const SD_CLK_GPIO: i32 = 12;
 const SD_CMD_GPIO: i32 = 11;
@@ -10,6 +10,14 @@ const SDMMC_HOST_FLAG_4BIT: u32 = 1 << 1;
 const SDMMC_HOST_FLAG_8BIT: u32 = 1 << 2;
 const SDMMC_HOST_FLAG_DDR: u32 = 1 << 4;
 const SDMMC_SLOT_FLAG_INTERNAL_PULLUP: u32 = 1 << 0;
+const SD_BASE_PATH: &str = "/sdcard";
+
+#[derive(Debug, Clone)]
+pub struct SdEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
 
 fn sdmmc_host_default() -> sys::sdmmc_host_t {
     let mut host = sys::sdmmc_host_t::default();
@@ -35,15 +43,7 @@ fn sdmmc_host_default() -> sys::sdmmc_host_t {
     host
 }
 
-pub fn run_sdcard_format_test<F>(mut progress: F) -> Result<()>
-where
-    F: FnMut(u8, &str) -> Result<()>,
-{
-    let base_path = CString::new("/sdcard")?;
-    let mut card: *mut sys::sdmmc_card_t = ptr::null_mut();
-
-    let host = sdmmc_host_default();
-
+fn sdmmc_slot_default_1bit() -> sys::sdmmc_slot_config_t {
     let mut slot = sys::sdmmc_slot_config_t::default();
     slot.clk = SD_CLK_GPIO;
     slot.cmd = SD_CMD_GPIO;
@@ -63,15 +63,23 @@ where
     };
     slot.width = 1;
     slot.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+    slot
+}
 
-    let mount_cfg = sys::esp_vfs_fat_mount_config_t {
+fn mount_cfg() -> sys::esp_vfs_fat_mount_config_t {
+    sys::esp_vfs_fat_mount_config_t {
         format_if_mount_failed: false,
         max_files: 4,
         allocation_unit_size: 0,
         disk_status_check_enable: false,
-    };
+    }
+}
 
-    progress(5, "Initialisiere...")?;
+fn mount_sd(base_path: &CString) -> Result<*mut sys::sdmmc_card_t> {
+    let host = sdmmc_host_default();
+    let slot = sdmmc_slot_default_1bit();
+    let mount_cfg = mount_cfg();
+    let mut card: *mut sys::sdmmc_card_t = ptr::null_mut();
     crate::esp_ok(unsafe {
         sys::esp_vfs_fat_sdmmc_mount(
             base_path.as_ptr(),
@@ -81,15 +89,55 @@ where
             &mut card,
         )
     })?;
+    Ok(card)
+}
+
+pub fn list_sd_root() -> Result<Vec<SdEntry>> {
+    let base_path = CString::new(SD_BASE_PATH)?;
+    let card = mount_sd(&base_path)?;
+
+    let list_result = (|| -> Result<Vec<SdEntry>> {
+        let mut out: Vec<SdEntry> = Vec::new();
+        for entry in fs::read_dir(SD_BASE_PATH)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            out.push(SdEntry {
+                name: entry.file_name().to_string_lossy().to_string(),
+                is_dir: meta.is_dir(),
+                size: meta.len(),
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    })();
+
+    let unmount_result =
+        crate::esp_ok(unsafe { sys::esp_vfs_fat_sdcard_unmount(base_path.as_ptr(), card) });
+    if let Err(err) = list_result {
+        let _ = unmount_result;
+        return Err(err);
+    }
+    unmount_result?;
+    list_result
+}
+
+pub fn run_sdcard_format_test<F>(mut progress: F) -> Result<()>
+where
+    F: FnMut(u8, &str) -> Result<()>,
+{
+    let base_path = CString::new(SD_BASE_PATH)?;
+
+    progress(5, "Initialisiere...")?;
+    let card = mount_sd(&base_path)?;
     progress(25, "SD erkannt")?;
 
     let test_result = (|| -> Result<()> {
         progress(40, "Formatiere...")?;
         crate::esp_ok(unsafe { sys::esp_vfs_fat_sdcard_format(base_path.as_ptr(), card) })?;
         progress(75, "Schreibe test.txt...")?;
-        std::fs::write("/sdcard/test.txt", "OK")?;
+        fs::write("/sdcard/test.txt", "OK")?;
         progress(90, "Lese test.txt...")?;
-        let content = std::fs::read_to_string("/sdcard/test.txt")?;
+        let content = fs::read_to_string("/sdcard/test.txt")?;
         if content.trim() == "OK" {
             Ok(())
         } else {

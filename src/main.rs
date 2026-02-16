@@ -14,6 +14,7 @@ use std::{convert::Infallible, ffi::CString, ptr};
 
 pub mod device;
 pub mod gps;
+pub mod http_server;
 pub mod sdcard;
 pub mod ui;
 pub mod wifi;
@@ -21,13 +22,14 @@ pub mod wifi;
 use device::read_battery_once;
 use ui::{
     clear_screen, draw_battery_status_frame, draw_battery_status_values, draw_battery_unavailable,
-    draw_bitmap, draw_device_menu, draw_header, draw_menu, draw_text_box,
-    draw_wifi_channel_monitor, draw_wifi_frame, draw_wifi_menu, draw_wifi_message,
-    draw_wifi_monitor, draw_wifi_screen, BatteryLabels, PacketSample, RssiSeries, BACK_BTN_H,
-    BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, DEVICE_MENU_BTN1_Y, DEVICE_MENU_BTN2_Y, DEVICE_MENU_BTN3_Y,
-    DEVICE_MENU_BTN4_Y, MENU_BTN1_Y, MENU_BTN2_Y, MENU_BTN_H, MENU_BTN_W, MENU_BTN_X,
-    WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X, WIFI_CH_BTN_RIGHT_X, WIFI_CH_BTN_W, WIFI_CH_BTN_Y,
-    WIFI_MENU_BTN1_Y, WIFI_MENU_BTN2_Y, WIFI_MENU_BTN3_Y,
+    draw_bitmap, draw_device_menu, draw_header, draw_http_menu, draw_menu, draw_text_box,
+    draw_text_box_small, draw_wifi_channel_monitor, draw_wifi_frame, draw_wifi_menu,
+    draw_wifi_message, draw_wifi_monitor, draw_wifi_screen, BatteryLabels, PacketSample,
+    RssiSeries, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, DEVICE_MENU_BTN1_Y,
+    DEVICE_MENU_BTN2_Y, DEVICE_MENU_BTN3_Y, DEVICE_MENU_BTN4_Y, DEVICE_MENU_BTN5_Y,
+    DEVICE_MENU_BTN6_Y, HTTP_MENU_BTN1_Y, MENU_BTN1_Y, MENU_BTN2_Y, MENU_BTN_H, MENU_BTN_W,
+    MENU_BTN_X, WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X, WIFI_CH_BTN_RIGHT_X, WIFI_CH_BTN_W,
+    WIFI_CH_BTN_Y, WIFI_MENU_BTN1_Y, WIFI_MENU_BTN2_Y, WIFI_MENU_BTN3_Y,
 };
 
 pub const LCD_H_RES: i32 = 240;
@@ -52,6 +54,13 @@ const BL_GPIO: i32 = 38;
 // External/reed switch input; Arduino example treats it as active-high.
 const POWER_BTN_GPIO: i32 = 21;
 const POWER_BTN_DEBOUNCE_MS: u32 = 40;
+fn wifi_default_ssid() -> &'static str {
+    option_env!("WIFI_DEFAULT_SSID").unwrap_or("")
+}
+
+fn wifi_default_password() -> &'static str {
+    option_env!("WIFI_DEFAULT_PASSWORD").unwrap_or("")
+}
 
 fn enter_deep_sleep() -> ! {
     unsafe {
@@ -537,6 +546,9 @@ enum Screen {
     DeviceMenu,
     BatteryStatus,
     SdCardFormat,
+    HttpMenu,
+    WifiLogin,
+    WifiConnected,
 }
 
 struct MonitorSeries {
@@ -554,6 +566,49 @@ const CHANNEL_MIN: u8 = 1;
 const CHANNEL_MAX: u8 = 13;
 const CHANNEL_SAMPLE_MAX: usize = 60;
 const CHANNEL_SAMPLE_INTERVAL_MS: u32 = 500;
+const WIFI_LOGIN_LINE_Y: i32 = 52;
+const WIFI_LOGIN_LINE_H: i32 = 18;
+const WIFI_LOGIN_MAX_ITEMS: usize = 4;
+const WIFI_LOGIN_SCROLL_Y: i32 = 126;
+const WIFI_LOGIN_SCROLL_BTN_W: i32 = 52;
+const WIFI_LOGIN_SCROLL_BTN_H: i32 = 22;
+const WIFI_LOGIN_SCROLL_UP_X: i32 = 8;
+const WIFI_LOGIN_SCROLL_DOWN_X: i32 = 66;
+const WIFI_LOGIN_SCAN_BTN_X: i32 = 124;
+const WIFI_LOGIN_SCAN_BTN_Y: i32 = 126;
+const WIFI_LOGIN_SCAN_BTN_W: i32 = 108;
+const WIFI_LOGIN_DEFAULT_BTN_X: i32 = 8;
+const WIFI_LOGIN_DEFAULT_BTN_Y: i32 = 152;
+const WIFI_LOGIN_DEFAULT_BTN_W: i32 = 108;
+const WIFI_LOGIN_CONNECT_BTN_X: i32 = 124;
+const WIFI_LOGIN_CONNECT_BTN_Y: i32 = 152;
+const WIFI_LOGIN_CONNECT_BTN_W: i32 = 108;
+const WIFI_LOGIN_CHAR_BTN_Y: i32 = 212;
+const WIFI_LOGIN_CHAR_BTN_W: i32 = 52;
+const WIFI_LOGIN_CHAR_BTN_H: i32 = 22;
+const WIFI_LOGIN_CHAR_PREV_X: i32 = 8;
+const WIFI_LOGIN_CHAR_NEXT_X: i32 = 66;
+const WIFI_LOGIN_CHAR_ADD_X: i32 = 124;
+const WIFI_LOGIN_CHAR_DEL_X: i32 = 182;
+const WIFI_LOGIN_CHARSET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+.";
+
+fn wifi_login_current_char(idx: usize) -> char {
+    WIFI_LOGIN_CHARSET.get(idx).copied().unwrap_or(b'a') as char
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for ch in s.chars().take(max_chars.saturating_sub(1)) {
+        out.push(ch);
+    }
+    out.push('~');
+    out
+}
 
 fn update_monitor_series(series: &mut Vec<MonitorSeries>, scan: &[(String, i8)]) {
     let mut top: Vec<(String, i8)> = scan.to_vec();
@@ -625,6 +680,236 @@ fn strongest_channel() -> Result<u8> {
         }
     }
     Ok(best.channel.clamp(CHANNEL_MIN, CHANNEL_MAX))
+}
+
+fn draw_wifi_login_screen(
+    panel: sys::esp_lcd_panel_handle_t,
+    items: &[wifi::WifiAp],
+    selected: Option<usize>,
+    offset: usize,
+    status: &str,
+    password: &str,
+    char_idx: usize,
+) -> Result<()> {
+    clear_screen(panel, Rgb565::BLACK)?;
+    draw_header(panel, "WiFi Login", true)?;
+
+    let end = (offset + WIFI_LOGIN_MAX_ITEMS).min(items.len());
+    for (row, ap) in items[offset..end].iter().enumerate() {
+        let idx = offset + row;
+        let y = WIFI_LOGIN_LINE_Y + (row as i32 * WIFI_LOGIN_LINE_H);
+        let fg = if Some(idx) == selected {
+            Rgb565::new(63, 63, 0)
+        } else {
+            Rgb565::new(0, 63, 0)
+        };
+        let lock = if ap.authmode == sys::wifi_auth_mode_t_WIFI_AUTH_OPEN {
+            "O"
+        } else {
+            "L"
+        };
+        let ssid = truncate_chars(&ap.ssid, 16);
+        draw_text_box_small(
+            panel,
+            0,
+            y,
+            LCD_H_RES,
+            WIFI_LOGIN_LINE_H,
+            &format!("{} {} {}dBm {}", idx + 1, ssid, ap.rssi, lock),
+            fg,
+            Rgb565::BLACK,
+        )?;
+    }
+
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_SCROLL_UP_X,
+        WIFI_LOGIN_SCROLL_Y,
+        WIFI_LOGIN_SCROLL_BTN_W,
+        WIFI_LOGIN_SCROLL_BTN_H,
+        "Up",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_SCROLL_DOWN_X,
+        WIFI_LOGIN_SCROLL_Y,
+        WIFI_LOGIN_SCROLL_BTN_W,
+        WIFI_LOGIN_SCROLL_BTN_H,
+        "Down",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_SCAN_BTN_X,
+        WIFI_LOGIN_SCAN_BTN_Y,
+        WIFI_LOGIN_SCAN_BTN_W,
+        WIFI_LOGIN_SCROLL_BTN_H,
+        "Scan",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_DEFAULT_BTN_X,
+        WIFI_LOGIN_DEFAULT_BTN_Y,
+        WIFI_LOGIN_DEFAULT_BTN_W,
+        WIFI_LOGIN_SCROLL_BTN_H,
+        "Default",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_CONNECT_BTN_X,
+        WIFI_LOGIN_CONNECT_BTN_Y,
+        WIFI_LOGIN_CONNECT_BTN_W,
+        WIFI_LOGIN_SCROLL_BTN_H,
+        "Connect",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+
+    let selected_ssid = selected
+        .and_then(|i| items.get(i))
+        .map(|ap| truncate_chars(&ap.ssid, 18))
+        .unwrap_or_else(|| "-".to_string());
+    draw_text_box_small(
+        panel,
+        0,
+        180,
+        LCD_H_RES,
+        12,
+        &format!("SSID: {}", selected_ssid),
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+
+    let masked = "*".repeat(password.chars().count());
+    let selected_channel = selected
+        .and_then(|i| items.get(i))
+        .map(|ap| ap.channel)
+        .unwrap_or(0);
+    draw_text_box_small(
+        panel,
+        0,
+        194,
+        LCD_H_RES,
+        12,
+        &format!(
+            "PWD: {}  CH:{}  CHR:{}",
+            masked,
+            selected_channel,
+            wifi_login_current_char(char_idx)
+        ),
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_CHAR_PREV_X,
+        WIFI_LOGIN_CHAR_BTN_Y,
+        WIFI_LOGIN_CHAR_BTN_W,
+        WIFI_LOGIN_CHAR_BTN_H,
+        "<",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_CHAR_NEXT_X,
+        WIFI_LOGIN_CHAR_BTN_Y,
+        WIFI_LOGIN_CHAR_BTN_W,
+        WIFI_LOGIN_CHAR_BTN_H,
+        ">",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_CHAR_ADD_X,
+        WIFI_LOGIN_CHAR_BTN_Y,
+        WIFI_LOGIN_CHAR_BTN_W,
+        WIFI_LOGIN_CHAR_BTN_H,
+        "Add",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        WIFI_LOGIN_CHAR_DEL_X,
+        WIFI_LOGIN_CHAR_BTN_Y,
+        WIFI_LOGIN_CHAR_BTN_W,
+        WIFI_LOGIN_CHAR_BTN_H,
+        "Del",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        284,
+        LCD_H_RES,
+        12,
+        &truncate_chars(status, 30),
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    Ok(())
+}
+
+fn draw_wifi_connected_screen(
+    panel: sys::esp_lcd_panel_handle_t,
+    ssid: &str,
+    rssi: i8,
+    channel: u8,
+    ip: &str,
+) -> Result<()> {
+    clear_screen(panel, Rgb565::BLACK)?;
+    draw_header(panel, "WiFi Verbunden", true)?;
+    draw_text_box_small(
+        panel,
+        0,
+        64,
+        LCD_H_RES,
+        14,
+        &format!("SSID: {}", truncate_chars(ssid, 22)),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        84,
+        LCD_H_RES,
+        14,
+        &format!("Kanal: {}", channel),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        104,
+        LCD_H_RES,
+        14,
+        &format!("RSSI: {} dBm", rssi),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        124,
+        LCD_H_RES,
+        14,
+        &format!("IP: {}", ip),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -705,6 +990,18 @@ fn main() -> Result<()> {
     let mut loopback_last_redraw: u32 = 0;
     let mut sd_result_ok = false;
     let mut sd_result_msg = String::new();
+    let mut http_server: Option<http_server::MiniHttpServer> = None;
+    let mut http_status = String::from("Aus");
+    let mut wifi_login_items: Vec<wifi::WifiAp> = Vec::new();
+    let mut wifi_login_selected: Option<usize> = None;
+    let mut wifi_login_offset: usize = 0;
+    let mut wifi_login_status = String::from("Scan und Netz waehlen");
+    let mut wifi_login_password = wifi_default_password().to_string();
+    let mut wifi_login_char_idx: usize = 0;
+    let mut wifi_connected_ssid = String::new();
+    let mut wifi_connected_rssi: i8 = 0;
+    let mut wifi_connected_channel: u8 = 0;
+    let mut wifi_connected_ip = String::new();
     loop {
         let power_btn_raw = power_btn.is_high();
         if power_btn_raw && !power_btn_last_raw {
@@ -964,6 +1261,16 @@ fn main() -> Result<()> {
                     && x < MENU_BTN_X + MENU_BTN_W
                     && y >= DEVICE_MENU_BTN4_Y
                     && y < DEVICE_MENU_BTN4_Y + MENU_BTN_H;
+                let hit_http_menu = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= DEVICE_MENU_BTN5_Y
+                    && y < DEVICE_MENU_BTN5_Y + MENU_BTN_H;
+                let hit_wifi_login = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= DEVICE_MENU_BTN6_Y
+                    && y < DEVICE_MENU_BTN6_Y + MENU_BTN_H;
                 if hit_back && !was_pressed {
                     screen = Screen::Menu;
                     draw_menu(panel)?;
@@ -1089,8 +1396,94 @@ fn main() -> Result<()> {
                             Rgb565::BLACK,
                         )?;
                     }
+                } else if hit_http_menu && !was_pressed {
+                    screen = Screen::HttpMenu;
+                    draw_http_menu(panel)?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        130,
+                        LCD_H_RES,
+                        24,
+                        "Tippen: Start/Stop",
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        156,
+                        LCD_H_RES,
+                        24,
+                        &format!("Status: {}", http_status),
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        186,
+                        LCD_H_RES,
+                        24,
+                        "Pfad: /sd",
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                } else if hit_wifi_login && !was_pressed {
+                    screen = Screen::WifiLogin;
+                    wifi_login_status = String::from("Scanne...");
+                    match wifi::wifi_scan_records() {
+                        Ok(items) => {
+                            wifi_login_items = items;
+                            wifi_login_selected = wifi_login_items
+                                .iter()
+                                .position(|ap| {
+                                    !wifi_default_ssid().is_empty()
+                                        && ap.ssid == wifi_default_ssid()
+                                })
+                                .or_else(|| {
+                                    if wifi_login_items.is_empty() {
+                                        None
+                                    } else {
+                                        Some(0)
+                                    }
+                                });
+                            wifi_login_offset = wifi_login_selected
+                                .map(|idx| (idx / WIFI_LOGIN_MAX_ITEMS) * WIFI_LOGIN_MAX_ITEMS)
+                                .unwrap_or(0);
+                            if wifi_login_items.is_empty() {
+                                wifi_login_status = String::from("Keine Netze gefunden");
+                            } else if let Some(idx) = wifi_login_selected {
+                                wifi_login_status =
+                                    format!("Ausgewaehlt: {}", wifi_login_items[idx].ssid);
+                            } else {
+                                wifi_login_status = String::from("Netz waehlen, dann Connect");
+                            }
+                        }
+                        Err(err) => {
+                            wifi_login_items.clear();
+                            wifi_login_selected = None;
+                            wifi_login_offset = 0;
+                            wifi_login_status = format!("Scan Fehler: {}", err);
+                        }
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
                 }
-                was_pressed = hit_back || hit_batt || hit_gps || hit_loopback || hit_sd_format;
+                was_pressed = hit_back
+                    || hit_batt
+                    || hit_gps
+                    || hit_loopback
+                    || hit_sd_format
+                    || hit_http_menu
+                    || hit_wifi_login;
             }
             Screen::Gps => {
                 let hit_back = touch_down
@@ -1172,6 +1565,548 @@ fn main() -> Result<()> {
                 if hit_back && !was_pressed {
                     screen = Screen::DeviceMenu;
                     draw_device_menu(panel)?;
+                }
+                was_pressed = hit_back;
+            }
+            Screen::HttpMenu => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                let hit_sd_view = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= HTTP_MENU_BTN1_Y
+                    && y < HTTP_MENU_BTN1_Y + MENU_BTN_H;
+                if hit_back && !was_pressed {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
+                } else if hit_sd_view && !was_pressed {
+                    if http_server.is_none() {
+                        match http_server::MiniHttpServer::start(8080) {
+                            Ok(server) => {
+                                let port = server.port();
+                                http_server = Some(server);
+                                http_status = format!("AN (Port {})", port);
+                            }
+                            Err(err) => {
+                                http_status = format!("Fehler: {}", err);
+                            }
+                        }
+                    } else if let Some(mut server) = http_server.take() {
+                        server.stop();
+                        http_status = String::from("Aus");
+                    }
+
+                    draw_http_menu(panel)?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        130,
+                        LCD_H_RES,
+                        24,
+                        "Tippen: Start/Stop",
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        156,
+                        LCD_H_RES,
+                        24,
+                        &format!("Status: {}", http_status),
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        186,
+                        LCD_H_RES,
+                        24,
+                        "Browser: http://<IP>:8080/sd",
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                }
+                was_pressed = hit_back || hit_sd_view;
+            }
+            Screen::WifiLogin => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                let hit_scan = touch_down
+                    && x >= WIFI_LOGIN_SCAN_BTN_X
+                    && x < WIFI_LOGIN_SCAN_BTN_X + WIFI_LOGIN_SCAN_BTN_W
+                    && y >= WIFI_LOGIN_SCAN_BTN_Y
+                    && y < WIFI_LOGIN_SCAN_BTN_Y + WIFI_LOGIN_SCROLL_BTN_H;
+                let hit_connect = touch_down
+                    && x >= WIFI_LOGIN_CONNECT_BTN_X
+                    && x < WIFI_LOGIN_CONNECT_BTN_X + WIFI_LOGIN_CONNECT_BTN_W
+                    && y >= WIFI_LOGIN_CONNECT_BTN_Y
+                    && y < WIFI_LOGIN_CONNECT_BTN_Y + WIFI_LOGIN_SCROLL_BTN_H;
+                let hit_default = touch_down
+                    && x >= WIFI_LOGIN_DEFAULT_BTN_X
+                    && x < WIFI_LOGIN_DEFAULT_BTN_X + WIFI_LOGIN_DEFAULT_BTN_W
+                    && y >= WIFI_LOGIN_DEFAULT_BTN_Y
+                    && y < WIFI_LOGIN_DEFAULT_BTN_Y + WIFI_LOGIN_SCROLL_BTN_H;
+                let hit_scroll_up = touch_down
+                    && x >= WIFI_LOGIN_SCROLL_UP_X
+                    && x < WIFI_LOGIN_SCROLL_UP_X + WIFI_LOGIN_SCROLL_BTN_W
+                    && y >= WIFI_LOGIN_SCROLL_Y
+                    && y < WIFI_LOGIN_SCROLL_Y + WIFI_LOGIN_SCROLL_BTN_H;
+                let hit_scroll_down = touch_down
+                    && x >= WIFI_LOGIN_SCROLL_DOWN_X
+                    && x < WIFI_LOGIN_SCROLL_DOWN_X + WIFI_LOGIN_SCROLL_BTN_W
+                    && y >= WIFI_LOGIN_SCROLL_Y
+                    && y < WIFI_LOGIN_SCROLL_Y + WIFI_LOGIN_SCROLL_BTN_H;
+                let hit_char_prev = touch_down
+                    && x >= WIFI_LOGIN_CHAR_PREV_X
+                    && x < WIFI_LOGIN_CHAR_PREV_X + WIFI_LOGIN_CHAR_BTN_W
+                    && y >= WIFI_LOGIN_CHAR_BTN_Y
+                    && y < WIFI_LOGIN_CHAR_BTN_Y + WIFI_LOGIN_CHAR_BTN_H;
+                let hit_char_next = touch_down
+                    && x >= WIFI_LOGIN_CHAR_NEXT_X
+                    && x < WIFI_LOGIN_CHAR_NEXT_X + WIFI_LOGIN_CHAR_BTN_W
+                    && y >= WIFI_LOGIN_CHAR_BTN_Y
+                    && y < WIFI_LOGIN_CHAR_BTN_Y + WIFI_LOGIN_CHAR_BTN_H;
+                let hit_char_add = touch_down
+                    && x >= WIFI_LOGIN_CHAR_ADD_X
+                    && x < WIFI_LOGIN_CHAR_ADD_X + WIFI_LOGIN_CHAR_BTN_W
+                    && y >= WIFI_LOGIN_CHAR_BTN_Y
+                    && y < WIFI_LOGIN_CHAR_BTN_Y + WIFI_LOGIN_CHAR_BTN_H;
+                let hit_char_del = touch_down
+                    && x >= WIFI_LOGIN_CHAR_DEL_X
+                    && x < WIFI_LOGIN_CHAR_DEL_X + WIFI_LOGIN_CHAR_BTN_W
+                    && y >= WIFI_LOGIN_CHAR_BTN_Y
+                    && y < WIFI_LOGIN_CHAR_BTN_Y + WIFI_LOGIN_CHAR_BTN_H;
+
+                let mut hit_list = None;
+                if touch_down {
+                    let visible = WIFI_LOGIN_MAX_ITEMS
+                        .min(wifi_login_items.len().saturating_sub(wifi_login_offset));
+                    for row in 0..visible {
+                        let ly = WIFI_LOGIN_LINE_Y + (row as i32 * WIFI_LOGIN_LINE_H);
+                        if x >= 0 && x < LCD_H_RES && y >= ly && y < ly + WIFI_LOGIN_LINE_H {
+                            hit_list = Some(wifi_login_offset + row);
+                            break;
+                        }
+                    }
+                }
+
+                if hit_back && !was_pressed {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
+                } else if hit_scan && !was_pressed {
+                    wifi_login_status = String::from("Scanne...");
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                    match wifi::wifi_scan_records() {
+                        Ok(items) => {
+                            wifi_login_items = items;
+                            wifi_login_selected = wifi_login_items
+                                .iter()
+                                .position(|ap| {
+                                    !wifi_default_ssid().is_empty()
+                                        && ap.ssid == wifi_default_ssid()
+                                })
+                                .or_else(|| {
+                                    if wifi_login_items.is_empty() {
+                                        None
+                                    } else {
+                                        Some(0)
+                                    }
+                                });
+                            wifi_login_offset = wifi_login_selected
+                                .map(|idx| (idx / WIFI_LOGIN_MAX_ITEMS) * WIFI_LOGIN_MAX_ITEMS)
+                                .unwrap_or(0);
+                            wifi_login_status = if wifi_login_items.is_empty() {
+                                String::from("Keine Netze gefunden")
+                            } else if let Some(idx) = wifi_login_selected {
+                                format!("Ausgewaehlt: {}", wifi_login_items[idx].ssid)
+                            } else {
+                                String::from("Netz waehlen, dann Connect")
+                            };
+                        }
+                        Err(err) => {
+                            wifi_login_status = format!("Scan Fehler: {}", err);
+                        }
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                } else if hit_scroll_up && !was_pressed {
+                    if wifi_login_offset >= WIFI_LOGIN_MAX_ITEMS {
+                        wifi_login_offset -= WIFI_LOGIN_MAX_ITEMS;
+                    } else {
+                        wifi_login_offset = 0;
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                } else if hit_scroll_down && !was_pressed {
+                    if wifi_login_offset + WIFI_LOGIN_MAX_ITEMS < wifi_login_items.len() {
+                        wifi_login_offset += WIFI_LOGIN_MAX_ITEMS;
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                } else if let Some(idx) = hit_list {
+                    if !was_pressed {
+                        wifi_login_selected = Some(idx);
+                        wifi_login_status = format!("Ausgewaehlt: {}", wifi_login_items[idx].ssid);
+                        draw_wifi_login_screen(
+                            panel,
+                            &wifi_login_items,
+                            wifi_login_selected,
+                            wifi_login_offset,
+                            &wifi_login_status,
+                            &wifi_login_password,
+                            wifi_login_char_idx,
+                        )?;
+                    }
+                } else if hit_char_prev && !was_pressed {
+                    if wifi_login_char_idx == 0 {
+                        wifi_login_char_idx = WIFI_LOGIN_CHARSET.len().saturating_sub(1);
+                    } else {
+                        wifi_login_char_idx -= 1;
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                } else if hit_char_next && !was_pressed {
+                    if !WIFI_LOGIN_CHARSET.is_empty() {
+                        wifi_login_char_idx = (wifi_login_char_idx + 1) % WIFI_LOGIN_CHARSET.len();
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                } else if hit_char_add && !was_pressed {
+                    if wifi_login_password.len() < 63 {
+                        wifi_login_password.push(wifi_login_current_char(wifi_login_char_idx));
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                } else if hit_char_del && !was_pressed {
+                    let _ = wifi_login_password.pop();
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                } else if hit_default && !was_pressed {
+                    let default_ssid = wifi_default_ssid();
+                    let default_password = wifi_default_password();
+                    if default_ssid.is_empty() {
+                        wifi_login_status = String::from("Default SSID fehlt (wifi_secrets.local)");
+                        draw_wifi_login_screen(
+                            panel,
+                            &wifi_login_items,
+                            wifi_login_selected,
+                            wifi_login_offset,
+                            &wifi_login_status,
+                            &wifi_login_password,
+                            wifi_login_char_idx,
+                        )?;
+                        was_pressed = true;
+                        continue;
+                    }
+                    wifi_login_status = format!("Default connect {}...", default_ssid);
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+
+                    let mut connected_info: Option<wifi::WifiConnectionInfo> = None;
+                    let mut connect_error = String::new();
+                    let default_ap = wifi::wifi_scan_records()
+                        .ok()
+                        .and_then(|items| items.into_iter().find(|ap| ap.ssid == default_ssid));
+                    if let Some(ap) = default_ap.as_ref() {
+                        println!(
+                            "[WIFI] default AP gefunden ssid='{}' ch={} auth={:?}",
+                            ap.ssid, ap.channel, ap.authmode
+                        );
+                    } else {
+                        println!(
+                            "[WIFI] default AP '{}' nicht im Scan gefunden, nutze direkten Connect",
+                            default_ssid
+                        );
+                    }
+
+                    let connect_result = if let Some(ap) = default_ap.as_ref() {
+                        wifi::wifi_connect_ap(ap, default_password)
+                    } else {
+                        wifi::wifi_connect(default_ssid, default_password)
+                    };
+
+                    match connect_result {
+                        Ok(()) => match wifi::wifi_wait_connected(12_000) {
+                            Ok(info) => connected_info = Some(info),
+                            Err(err) => {
+                                connect_error = format!("default wait: {}", err);
+                                println!("[WIFI] default wait failed: {}", err);
+                            }
+                        },
+                        Err(err) => {
+                            connect_error = format!("default connect: {}", err);
+                            println!("[WIFI] default connect failed: {}", err);
+                        }
+                    }
+
+                    if let Some(info) = connected_info {
+                        wifi_connected_ssid = if info.ssid.is_empty() {
+                            default_ssid.to_string()
+                        } else {
+                            info.ssid.clone()
+                        };
+                        wifi_connected_rssi = info.rssi;
+                        wifi_connected_channel = info.channel;
+                        wifi_connected_ip =
+                            wifi::wifi_wait_ipv4(8_000).unwrap_or_else(|_| "-".to_string());
+                        screen = Screen::WifiConnected;
+                        draw_wifi_connected_screen(
+                            panel,
+                            &wifi_connected_ssid,
+                            wifi_connected_rssi,
+                            wifi_connected_channel,
+                            &wifi_connected_ip,
+                        )?;
+                        was_pressed = true;
+                        continue;
+                    } else if connect_error.is_empty() {
+                        wifi_login_status = String::from("Default Connect fehlgeschlagen");
+                    } else {
+                        wifi_login_status = format!("Default Fehler: {}", connect_error);
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                } else if hit_connect && !was_pressed {
+                    if let Some(idx) = wifi_login_selected {
+                        let ap = &wifi_login_items[idx];
+                        let default_ssid = wifi_default_ssid();
+                        let default_password = wifi_default_password();
+                        if !default_ssid.is_empty()
+                            && ap.ssid != default_ssid
+                            && !default_password.is_empty()
+                            && wifi_login_password == default_password
+                        {
+                            wifi_login_status =
+                                format!("Achtung: Default-PWD ist fuer {}", default_ssid);
+                            draw_wifi_login_screen(
+                                panel,
+                                &wifi_login_items,
+                                wifi_login_selected,
+                                wifi_login_offset,
+                                &wifi_login_status,
+                                &wifi_login_password,
+                                wifi_login_char_idx,
+                            )?;
+                            was_pressed = true;
+                            continue;
+                        }
+                        let password = if ap.authmode == sys::wifi_auth_mode_t_WIFI_AUTH_OPEN {
+                            ""
+                        } else {
+                            wifi_login_password.as_str()
+                        };
+                        if ap.authmode != sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
+                            && wifi_login_password.is_empty()
+                        {
+                            wifi_login_status = String::from("Passwort eingeben (Add/Del)");
+                            draw_wifi_login_screen(
+                                panel,
+                                &wifi_login_items,
+                                wifi_login_selected,
+                                wifi_login_offset,
+                                &wifi_login_status,
+                                &wifi_login_password,
+                                wifi_login_char_idx,
+                            )?;
+                            was_pressed = true;
+                            continue;
+                        };
+                        wifi_login_status = format!("Verbinde mit {}...", ap.ssid);
+                        draw_wifi_login_screen(
+                            panel,
+                            &wifi_login_items,
+                            wifi_login_selected,
+                            wifi_login_offset,
+                            &wifi_login_status,
+                            &wifi_login_password,
+                            wifi_login_char_idx,
+                        )?;
+
+                        let selected_ssid = ap.ssid.clone();
+                        let mut connect_error = String::new();
+
+                        let mut connected_info: Option<wifi::WifiConnectionInfo> = None;
+                        match wifi::wifi_connect_ap(ap, password) {
+                            Ok(()) => match wifi::wifi_wait_connected(10_000) {
+                                Ok(info) => connected_info = Some(info),
+                                Err(err) => {
+                                    connect_error = format!("connect_ap wait: {}", err);
+                                    println!("[WIFI] connect_ap wait failed: {}", err);
+                                }
+                            },
+                            Err(err) => {
+                                connect_error = format!("connect_ap: {}", err);
+                                println!("[WIFI] connect_ap failed: {}", err);
+                            }
+                        }
+
+                        if connected_info.is_none() {
+                            println!("[WIFI] fallback connect ssid='{}'", ap.ssid);
+                            match wifi::wifi_connect(&ap.ssid, password) {
+                                Ok(()) => match wifi::wifi_wait_connected(10_000) {
+                                    Ok(info) => connected_info = Some(info),
+                                    Err(err) => {
+                                        if !connect_error.is_empty() {
+                                            connect_error.push_str(" | ");
+                                        }
+                                        connect_error.push_str(&format!("fallback wait: {}", err));
+                                        println!("[WIFI] fallback wait failed: {}", err);
+                                    }
+                                },
+                                Err(err) => {
+                                    if !connect_error.is_empty() {
+                                        connect_error.push_str(" | ");
+                                    }
+                                    connect_error.push_str(&format!("fallback: {}", err));
+                                    println!("[WIFI] fallback connect failed: {}", err);
+                                }
+                            }
+                        }
+
+                        if let Some(info) = connected_info {
+                            wifi_connected_ssid = if info.ssid.is_empty() {
+                                selected_ssid
+                            } else {
+                                info.ssid.clone()
+                            };
+                            wifi_connected_rssi = info.rssi;
+                            wifi_connected_channel = info.channel;
+                            wifi_connected_ip =
+                                wifi::wifi_wait_ipv4(8_000).unwrap_or_else(|_| "-".to_string());
+                            screen = Screen::WifiConnected;
+                            draw_wifi_connected_screen(
+                                panel,
+                                &wifi_connected_ssid,
+                                wifi_connected_rssi,
+                                wifi_connected_channel,
+                                &wifi_connected_ip,
+                            )?;
+                            was_pressed = true;
+                            continue;
+                        } else if connect_error.is_empty() {
+                            wifi_login_status = String::from("Kein Connect");
+                        } else {
+                            wifi_login_status = format!("Kein Connect: {}", connect_error);
+                        }
+                    } else {
+                        wifi_login_status = String::from("Bitte zuerst ein Netz waehlen");
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                }
+                was_pressed =
+                    hit_back || hit_scan || hit_connect || hit_default || hit_list.is_some();
+                was_pressed = was_pressed
+                    || hit_char_prev
+                    || hit_char_next
+                    || hit_char_add
+                    || hit_char_del
+                    || hit_scroll_up
+                    || hit_scroll_down;
+            }
+            Screen::WifiConnected => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                if hit_back && !was_pressed {
+                    screen = Screen::WifiLogin;
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
                 }
                 was_pressed = hit_back;
             }

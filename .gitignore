@@ -13,3 +13,4 @@
 *.swo
 **/*.rs.bk
 .DS_Store
+wifi_secrets.local

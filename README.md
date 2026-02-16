@@ -46,6 +46,25 @@ cargo run
   - SD mount + format + write/read `test.txt`.
   - Progress is shown on display in percent (`0%`..`100%`).
   - Result screen stays visible until Back button is pressed.
+- `HTTP SD`
+  - Mini HTTP server submenu to expose SD card content over WiFi.
+  - Start/Stop from UI (`/sd` endpoint).
+- `WiFi Login`
+  - Scan/select AP, password input on device, connect from UI.
+  - `Default` button connects using credentials from `wifi_secrets.local`.
+  - After successful connect, a dedicated `WiFi Verbunden` screen shows:
+  - SSID, channel, RSSI, IPv4 address.
+
+## WiFi Default Credentials
+Default credentials are injected at build time from `wifi_secrets.local`
+and are intentionally git-ignored.
+
+Format:
+
+```text
+SSID=<your_ssid>
+PASSWORD=<your_password>
+```
 
 ## Host Logging (optional)
 If firmware is already flashed, read logs directly:
@@ -66,11 +85,12 @@ GPS host logs are only active while UI is on `Device -> GPS`.
 ## Project Structure
 - `src/main.rs`: app state machine and screen navigation
 - `src/ui.rs`: drawing/layout for all screens
-- `src/wifi.rs`: WiFi init, scan, monitor, channel/promiscuous capture
+- `src/wifi.rs`: WiFi init, scan, monitor, channel/promiscuous capture, connect helpers
 - `src/device.rs`: battery readout logic
 - `src/gps.rs`: GPS reader and UART loopback logic
 - `src/sdcard.rs`: SD mount/format/test flow
+- `src/http_server.rs`: mini HTTP server for SD browse/download
 
 ## Notes
 - Defaults/config: `sdkconfig.defaults`
-- Build helper: `build.rs`
+- Build helper: `build.rs` (reads `wifi_secrets.local` and sets `WIFI_DEFAULT_*`)

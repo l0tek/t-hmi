@@ -27,6 +27,9 @@ pub const DEVICE_MENU_BTN1_Y: i32 = 60;
 pub const DEVICE_MENU_BTN2_Y: i32 = 100;
 pub const DEVICE_MENU_BTN3_Y: i32 = 140;
 pub const DEVICE_MENU_BTN4_Y: i32 = 180;
+pub const DEVICE_MENU_BTN5_Y: i32 = 220;
+pub const DEVICE_MENU_BTN6_Y: i32 = 260;
+pub const HTTP_MENU_BTN1_Y: i32 = 80;
 pub const WIFI_CH_BTN_W: i32 = 28;
 pub const WIFI_CH_BTN_H: i32 = 22;
 pub const WIFI_CH_BTN_Y: i32 = LCD_V_RES - 28;
@@ -501,6 +504,33 @@ pub fn draw_device_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
         panel,
         DEVICE_MENU_BTN4_Y,
         "  SD Format",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_menu_line(
+        panel,
+        DEVICE_MENU_BTN5_Y,
+        "  Mini HTTP",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_menu_line(
+        panel,
+        DEVICE_MENU_BTN6_Y,
+        "  WiFi Login",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    Ok(())
+}
+
+pub fn draw_http_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
+    clear_screen(panel, Rgb565::BLACK)?;
+    draw_header(panel, "Mini HTTP", true)?;
+    draw_menu_line(
+        panel,
+        HTTP_MENU_BTN1_Y,
+        "  SD Karte anschauen",
         Rgb565::new(0, 63, 0),
         Rgb565::BLACK,
     )?;
