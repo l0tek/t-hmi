@@ -26,6 +26,7 @@ pub const WIFI_MENU_BTN3_Y: i32 = 140;
 pub const DEVICE_MENU_BTN1_Y: i32 = 60;
 pub const DEVICE_MENU_BTN2_Y: i32 = 100;
 pub const DEVICE_MENU_BTN3_Y: i32 = 140;
+pub const DEVICE_MENU_BTN4_Y: i32 = 180;
 pub const WIFI_CH_BTN_W: i32 = 28;
 pub const WIFI_CH_BTN_H: i32 = 22;
 pub const WIFI_CH_BTN_Y: i32 = LCD_V_RES - 28;
@@ -493,6 +494,13 @@ pub fn draw_device_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
         panel,
         DEVICE_MENU_BTN3_Y,
         "  UART Loopback",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_menu_line(
+        panel,
+        DEVICE_MENU_BTN4_Y,
+        "  SD Format",
         Rgb565::new(0, 63, 0),
         Rgb565::BLACK,
     )?;

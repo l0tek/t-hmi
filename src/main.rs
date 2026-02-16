@@ -14,18 +14,20 @@ use std::{convert::Infallible, ffi::CString, ptr};
 
 pub mod device;
 pub mod gps;
+pub mod sdcard;
 pub mod ui;
 pub mod wifi;
 
 use device::read_battery_once;
 use ui::{
     clear_screen, draw_battery_status_frame, draw_battery_status_values, draw_battery_unavailable,
-    draw_bitmap, draw_device_menu, draw_menu, draw_text_box, draw_wifi_channel_monitor,
-    draw_wifi_frame, draw_wifi_menu, draw_wifi_message, draw_wifi_monitor, draw_wifi_screen,
-    BatteryLabels, PacketSample, RssiSeries, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y,
-    DEVICE_MENU_BTN1_Y, DEVICE_MENU_BTN2_Y, DEVICE_MENU_BTN3_Y, MENU_BTN1_Y, MENU_BTN2_Y,
-    MENU_BTN_H, MENU_BTN_W, MENU_BTN_X, WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X, WIFI_CH_BTN_RIGHT_X,
-    WIFI_CH_BTN_W, WIFI_CH_BTN_Y, WIFI_MENU_BTN1_Y, WIFI_MENU_BTN2_Y, WIFI_MENU_BTN3_Y,
+    draw_bitmap, draw_device_menu, draw_header, draw_menu, draw_text_box,
+    draw_wifi_channel_monitor, draw_wifi_frame, draw_wifi_menu, draw_wifi_message,
+    draw_wifi_monitor, draw_wifi_screen, BatteryLabels, PacketSample, RssiSeries, BACK_BTN_H,
+    BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, DEVICE_MENU_BTN1_Y, DEVICE_MENU_BTN2_Y, DEVICE_MENU_BTN3_Y,
+    DEVICE_MENU_BTN4_Y, MENU_BTN1_Y, MENU_BTN2_Y, MENU_BTN_H, MENU_BTN_W, MENU_BTN_X,
+    WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X, WIFI_CH_BTN_RIGHT_X, WIFI_CH_BTN_W, WIFI_CH_BTN_Y,
+    WIFI_MENU_BTN1_Y, WIFI_MENU_BTN2_Y, WIFI_MENU_BTN3_Y,
 };
 
 pub const LCD_H_RES: i32 = 240;
@@ -534,6 +536,7 @@ enum Screen {
     UartLoopback,
     DeviceMenu,
     BatteryStatus,
+    SdCardFormat,
 }
 
 struct MonitorSeries {
@@ -700,6 +703,8 @@ fn main() -> Result<()> {
     let mut gps_last_redraw: u32 = 0;
     let mut gps_back_to_device = false;
     let mut loopback_last_redraw: u32 = 0;
+    let mut sd_result_ok = false;
+    let mut sd_result_msg = String::new();
     loop {
         let power_btn_raw = power_btn.is_high();
         if power_btn_raw && !power_btn_last_raw {
@@ -954,6 +959,11 @@ fn main() -> Result<()> {
                     && x < MENU_BTN_X + MENU_BTN_W
                     && y >= DEVICE_MENU_BTN3_Y
                     && y < DEVICE_MENU_BTN3_Y + MENU_BTN_H;
+                let hit_sd_format = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= DEVICE_MENU_BTN4_Y
+                    && y < DEVICE_MENU_BTN4_Y + MENU_BTN_H;
                 if hit_back && !was_pressed {
                     screen = Screen::Menu;
                     draw_menu(panel)?;
@@ -977,8 +987,110 @@ fn main() -> Result<()> {
                     loopback_last_redraw = tick_ms;
                     gps::draw_uart_loopback_frame(panel)?;
                     gps::draw_uart_loopback_values(panel, &gps_reader)?;
+                } else if hit_sd_format && !was_pressed {
+                    screen = Screen::SdCardFormat;
+                    clear_screen(panel, Rgb565::BLACK)?;
+                    draw_header(panel, "SD Format", true)?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        100,
+                        LCD_H_RES,
+                        30,
+                        "Formatiere SD...",
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        140,
+                        LCD_H_RES,
+                        40,
+                        "0%",
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                    match sdcard::run_sdcard_format_test(|percent, msg| {
+                        draw_text_box(
+                            panel,
+                            0,
+                            100,
+                            LCD_H_RES,
+                            30,
+                            msg,
+                            Rgb565::WHITE,
+                            Rgb565::BLACK,
+                        )?;
+                        let pct = format!("{percent}%");
+                        draw_text_box(
+                            panel,
+                            0,
+                            140,
+                            LCD_H_RES,
+                            40,
+                            &pct,
+                            Rgb565::WHITE,
+                            Rgb565::BLACK,
+                        )?;
+                        Ok(())
+                    }) {
+                        Ok(()) => {
+                            sd_result_ok = true;
+                            sd_result_msg = String::from("OK");
+                        }
+                        Err(err) => {
+                            sd_result_ok = false;
+                            sd_result_msg = format!("{}", err);
+                        }
+                    }
+                    clear_screen(panel, Rgb565::BLACK)?;
+                    draw_header(panel, "SD Format", true)?;
+                    if sd_result_ok {
+                        draw_text_box(
+                            panel,
+                            0,
+                            100,
+                            LCD_H_RES,
+                            30,
+                            "test.txt gelesen:",
+                            Rgb565::new(0, 63, 0),
+                            Rgb565::BLACK,
+                        )?;
+                        draw_text_box(
+                            panel,
+                            0,
+                            140,
+                            LCD_H_RES,
+                            40,
+                            "OK",
+                            Rgb565::new(0, 63, 0),
+                            Rgb565::BLACK,
+                        )?;
+                    } else {
+                        draw_text_box(
+                            panel,
+                            0,
+                            100,
+                            LCD_H_RES,
+                            30,
+                            "SD Fehler",
+                            Rgb565::new(63, 0, 0),
+                            Rgb565::BLACK,
+                        )?;
+                        draw_text_box(
+                            panel,
+                            0,
+                            140,
+                            LCD_H_RES,
+                            40,
+                            &sd_result_msg,
+                            Rgb565::new(63, 0, 0),
+                            Rgb565::BLACK,
+                        )?;
+                    }
                 }
-                was_pressed = hit_back || hit_batt || hit_gps || hit_loopback;
+                was_pressed = hit_back || hit_batt || hit_gps || hit_loopback || hit_sd_format;
             }
             Screen::Gps => {
                 let hit_back = touch_down
@@ -1048,6 +1160,18 @@ fn main() -> Result<()> {
                         draw_battery_status_values(panel, labels, status)?;
                     }
                     battery_last_read = tick_ms;
+                }
+                was_pressed = hit_back;
+            }
+            Screen::SdCardFormat => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                if hit_back && !was_pressed {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
                 }
                 was_pressed = hit_back;
             }

@@ -1,10 +1,11 @@
 # t-hmi
 
-Rust-based HMI project targeting ESP-IDF.
+Rust-based HMI project for ESP32-S3 (ESP-IDF via `esp-idf-sys`).
 
 ## Requirements
 - Rust toolchain (edition 2021)
-- ESP-IDF toolchain and environment set up for Rust
+- ESP-IDF toolchain/environment for Rust
+- Connected board (serial, e.g. `/dev/ttyACM0`)
 
 ## Build
 ```bash
@@ -16,28 +17,60 @@ cargo build
 cargo run
 ```
 
-## Host Logging (without `cargo run`)
-If firmware is already flashed, you can read logs directly from the serial port:
+## UI Overview
+### Main Menu
+- `WiFi`
+- `Bluetooth` (placeholder)
+- `GPS`
+- `Device`
+- `Reboot`
+
+### WiFi Menu
+- `Scan Wifi Network`
+  - Performs active scan and displays SSID + RSSI list.
+- `Monitor RSSI`
+  - Continuously scans and plots RSSI curves (top networks).
+- `Channel Monitor`
+  - Sets channel (1..13) and shows packet counters by type:
+  - Management / Data / Control
+  - Channel can be changed with on-screen left/right buttons.
+
+### Device Menu
+- `Batteriestatus`
+  - Live VBAT/ADC/raw/SoC/calibration display.
+- `GPS`
+  - GPS values view (fix/sats/lat/lon + diagnostics).
+- `UART Loopback`
+  - UART send/receive loopback diagnostics.
+- `SD Format`
+  - SD mount + format + write/read `test.txt`.
+  - Progress is shown on display in percent (`0%`..`100%`).
+  - Result screen stays visible until Back button is pressed.
+
+## Host Logging (optional)
+If firmware is already flashed, read logs directly:
 
 ```bash
 ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
 tio /dev/ttyACM0 -b 115200
 ```
 
-Optional: show only GPS diagnostics
+Only GPS diagnostics:
 
 ```bash
 tio /dev/ttyACM0 -b 115200 | stdbuf -oL grep '^\[GPS\]'
 ```
 
-GPS host logs are only enabled while the UI is on `Device -> GPS`.
+GPS host logs are only active while UI is on `Device -> GPS`.
 
 ## Project Structure
-- `src/main.rs`: Application entry point
-- `src/ui.rs`: UI/HMI rendering and interaction logic
-- `src/device.rs`: Device-specific handling
-- `src/gps.rs`: GPS-related functionality
+- `src/main.rs`: app state machine and screen navigation
+- `src/ui.rs`: drawing/layout for all screens
+- `src/wifi.rs`: WiFi init, scan, monitor, channel/promiscuous capture
+- `src/device.rs`: battery readout logic
+- `src/gps.rs`: GPS reader and UART loopback logic
+- `src/sdcard.rs`: SD mount/format/test flow
 
 ## Notes
-- Configuration defaults live in `sdkconfig.defaults`.
-- Build tooling is configured in `build.rs`.
+- Defaults/config: `sdkconfig.defaults`
+- Build helper: `build.rs`
