@@ -1265,7 +1265,7 @@ impl LoraSdLogger {
         let short_file_name = Self::make_file_name_83(unix_secs, run_id);
         let file_name = match session.append_line(
             &long_file_name,
-            "ts_ms;baud;tx_packets;tx_bytes;rx_bytes;rx_lines;ff_only;cmd_status;cmd_hex;last_line;rx_hex",
+            "ts_ms;profile;baud;tx_packets;tx_bytes;rx_bytes;rx_lines;ping_seen;last_ping_seq;ff_only;cmd_status;cmd_hex;last_line;rx_hex",
         ) {
             Ok(()) => long_file_name,
             Err(err) => {
@@ -1275,7 +1275,7 @@ impl LoraSdLogger {
                 );
                 session.append_line(
                     &short_file_name,
-                    "ts_ms;baud;tx_packets;tx_bytes;rx_bytes;rx_lines;ff_only;cmd_status;cmd_hex;last_line;rx_hex",
+                    "ts_ms;profile;baud;tx_packets;tx_bytes;rx_bytes;rx_lines;ping_seen;last_ping_seq;ff_only;cmd_status;cmd_hex;last_line;rx_hex",
                 )?;
                 short_file_name
             }
@@ -1314,14 +1314,21 @@ impl LoraSdLogger {
             .replace('\n', " ");
         let cmd_hex = lora.cmd_probe_hex().replace(';', ",");
         let rx_hex = lora.recent_hex().replace(';', ",");
+        let last_ping_seq = lora
+            .last_ping_seq()
+            .map(|v| format!("{v:03}"))
+            .unwrap_or_else(|| "-".to_string());
         let line = format!(
-            "{};{};{};{};{};{};{};{};{};{};{}",
+            "{};{};{};{};{};{};{};{};{};{};{};{};{};{}",
             now_ms,
+            "915.125/SF7/BW125/CR4/5",
             lora.current_baud(),
             lora.tx_packets(),
             lora.tx_bytes(),
             lora.rx_bytes(),
             lora.rx_lines(),
+            lora.ping_seen(),
+            last_ping_seq,
             if lora.ff_only_alert() { 1 } else { 0 },
             lora.cmd_probe_status(),
             cmd_hex,
@@ -1470,6 +1477,16 @@ fn draw_lora_logging_screen(
         178,
         LCD_H_RES,
         12,
+        "RF peer: 915.125 SF7 BW125 CR4/5",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        194,
+        LCD_H_RES,
+        12,
         &format!(
             "TX pkt:{} TX bytes:{} baud:{}",
             lora.tx_packets(),
@@ -1482,28 +1499,17 @@ fn draw_lora_logging_screen(
     draw_text_box_small(
         panel,
         0,
-        194,
-        LCD_H_RES,
-        12,
-        &format!(
-            "RX bytes:{} RX lines:{} ff:{}",
-            lora.rx_bytes(),
-            lora.rx_lines(),
-            if lora.ff_only_alert() { "ERR" } else { "OK" }
-        ),
-        Rgb565::new(0, 63, 0),
-        Rgb565::BLACK,
-    )?;
-    draw_text_box_small(
-        panel,
-        0,
         210,
         LCD_H_RES,
         12,
         &format!(
-            "CMD {} {}",
-            lora.cmd_probe_status(),
-            truncate_chars(lora.cmd_probe_hex(), 24)
+            "RX bytes:{} lines:{} ping:{} last:#{}",
+            lora.rx_bytes(),
+            lora.rx_lines(),
+            lora.ping_seen(),
+            lora.last_ping_seq()
+                .map(|v| format!("{v:03}"))
+                .unwrap_or_else(|| "---".to_string())
         ),
         Rgb565::new(0, 63, 0),
         Rgb565::BLACK,
@@ -1514,7 +1520,11 @@ fn draw_lora_logging_screen(
         226,
         LCD_H_RES,
         12,
-        &format!("Last:{}", truncate_chars(lora.last_line(), 30)),
+        &format!(
+            "Last:{} ff:{}",
+            truncate_chars(lora.last_line(), 20),
+            if lora.ff_only_alert() { "ERR" } else { "OK" }
+        ),
         Rgb565::new(0, 63, 0),
         Rgb565::BLACK,
     )?;

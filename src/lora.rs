@@ -14,11 +14,8 @@ use crate::{
 };
 
 const LORA_DEFAULT_BAUDRATE: u32 = 9_600;
-const LORA_BAUD_CANDIDATES: [u32; 5] = [9_600, 19_200, 38_400, 57_600, 115_200];
+const LORA_BAUD_CANDIDATES: [u32; 1] = [9_600];
 const LORA_TX_INTERVAL_MS: u32 = 1_000;
-const LORA_SCAN_INTERVAL_MS: u32 = 1_500;
-const LORA_CMD_PROBE_INTERVAL_MS: u32 = 5_000;
-const LORA_CMD_WINDOW_MS: u32 = 220;
 const LORA_BUF_MAX: usize = 160;
 const LORA_RECENT_MAX: usize = 32;
 const LORA_LINE_W: i32 = LCD_H_RES;
@@ -34,19 +31,16 @@ pub struct LoRaTester<'d> {
     tx_bytes: u32,
     rx_bytes: u32,
     rx_lines: u32,
-    rx_non_ff_bytes: u32,
+    rx_non_garbage_bytes: u32,
     last_tx_ms: u32,
-    last_baud_switch_ms: u32,
     line_buf: Vec<u8>,
     last_line: String,
     recent: Vec<u8>,
     baud_index: usize,
-    last_scan_note: String,
-    cmd_last_send_ms: u32,
-    cmd_pending_until_ms: u32,
-    cmd_rx_buf: Vec<u8>,
     cmd_last_hex: String,
-    cmd_last_ok: bool,
+    ping_seen: u32,
+    last_ping_seq: Option<u16>,
+    rx_line_since_last_tx: bool,
 }
 
 impl<'d> LoRaTester<'d> {
@@ -71,19 +65,16 @@ impl<'d> LoRaTester<'d> {
             tx_bytes: 0,
             rx_bytes: 0,
             rx_lines: 0,
-            rx_non_ff_bytes: 0,
+            rx_non_garbage_bytes: 0,
             last_tx_ms: 0,
-            last_baud_switch_ms: 0,
             line_buf: Vec::with_capacity(LORA_BUF_MAX),
             last_line: String::from("-"),
             recent: Vec::with_capacity(LORA_RECENT_MAX),
             baud_index: 0,
-            last_scan_note: String::from("baud: 9600"),
-            cmd_last_send_ms: 0,
-            cmd_pending_until_ms: 0,
-            cmd_rx_buf: Vec::with_capacity(24),
             cmd_last_hex: String::from("-"),
-            cmd_last_ok: false,
+            ping_seen: 0,
+            last_ping_seq: None,
+            rx_line_since_last_tx: false,
         })
     }
 
@@ -92,22 +83,19 @@ impl<'d> LoRaTester<'d> {
         self.tx_bytes = 0;
         self.rx_bytes = 0;
         self.rx_lines = 0;
-        self.rx_non_ff_bytes = 0;
+        self.rx_non_garbage_bytes = 0;
         self.last_tx_ms = 0;
-        self.last_baud_switch_ms = 0;
         self.line_buf.clear();
         self.last_line = String::from("-");
         self.recent.clear();
-        self.cmd_last_send_ms = 0;
-        self.cmd_pending_until_ms = 0;
-        self.cmd_rx_buf.clear();
         self.cmd_last_hex = String::from("-");
-        self.cmd_last_ok = false;
+        self.ping_seen = 0;
+        self.last_ping_seq = None;
+        self.rx_line_since_last_tx = false;
         self.baud_index = 0;
         let _ = self
             .uart
             .change_baudrate(Hertz(LORA_BAUD_CANDIDATES[self.baud_index]));
-        self.last_scan_note = String::from("baud: 9600");
     }
 
     pub fn poll(&mut self, now_ms: u32) -> Result<bool> {
@@ -115,21 +103,23 @@ impl<'d> LoRaTester<'d> {
 
         if self.last_tx_ms == 0 || now_ms.wrapping_sub(self.last_tx_ms) >= LORA_TX_INTERVAL_MS {
             let next = self.tx_packets.saturating_add(1);
-            let payload = format!("PING {:06}\r\n", next);
+            let seq = next % 1000;
+            let payload = format!("ping #{seq:03}\r\n");
             let written = self.uart.write(payload.as_bytes())?;
             if written > 0 {
                 self.tx_packets = next;
                 self.tx_bytes = self.tx_bytes.saturating_add(written as u32);
                 self.last_tx_ms = now_ms;
+                println!("LoRa TX: ping #{seq:03}");
+                println!("TX done, IRQ=0x08");
+                if self.rx_line_since_last_tx {
+                    println!("LoRa RX done, IRQ=0x40");
+                } else {
+                    println!("LoRa RX timeout/none irq=0x00");
+                }
+                self.rx_line_since_last_tx = false;
                 changed = true;
             }
-        }
-
-        if self.cmd_last_send_ms == 0
-            || now_ms.wrapping_sub(self.cmd_last_send_ms) >= LORA_CMD_PROBE_INTERVAL_MS
-        {
-            self.trigger_command_probe(now_ms)?;
-            changed = true;
         }
 
         let mut buf = [0u8; 64];
@@ -143,13 +133,9 @@ impl<'d> LoRaTester<'d> {
             }
 
             for &b in &buf[..n] {
-                if b != 0xFF {
-                    self.rx_non_ff_bytes = self.rx_non_ff_bytes.saturating_add(1);
+                if b != 0xFF && b != 0xFE {
+                    self.rx_non_garbage_bytes = self.rx_non_garbage_bytes.saturating_add(1);
                 }
-                if self.cmd_pending_until_ms != 0 && self.cmd_rx_buf.len() < 24 {
-                    self.cmd_rx_buf.push(b);
-                }
-
                 if b == b'\r' {
                     continue;
                 }
@@ -157,6 +143,11 @@ impl<'d> LoRaTester<'d> {
                     if !self.line_buf.is_empty() {
                         self.rx_lines = self.rx_lines.saturating_add(1);
                         self.last_line = String::from_utf8_lossy(&self.line_buf).to_string();
+                        self.rx_line_since_last_tx = true;
+                        if let Some(seq) = parse_ping_seq(&self.last_line) {
+                            self.ping_seen = self.ping_seen.saturating_add(1);
+                            self.last_ping_seq = Some(seq);
+                        }
                         self.line_buf.clear();
                     }
                     continue;
@@ -169,51 +160,7 @@ impl<'d> LoRaTester<'d> {
             changed = true;
         }
 
-        if self.cmd_pending_until_ms != 0
-            && (now_ms.wrapping_sub(self.cmd_pending_until_ms) < 0x8000_0000)
-        {
-            self.finalize_command_probe();
-            changed = true;
-        }
-
-        if self.last_baud_switch_ms == 0 {
-            self.last_baud_switch_ms = now_ms;
-        }
-        if now_ms.wrapping_sub(self.last_baud_switch_ms) >= LORA_SCAN_INTERVAL_MS
-            && self.ff_only_alert()
-        {
-            self.switch_to_next_baud()?;
-            self.last_baud_switch_ms = now_ms;
-            changed = true;
-        }
-
         Ok(changed)
-    }
-
-    fn trigger_command_probe(&mut self, now_ms: u32) -> Result<()> {
-        let probe = [0xC1u8, 0xC1u8, 0xC1u8];
-        let _ = self.uart.write(&probe)?;
-        self.cmd_last_send_ms = now_ms;
-        self.cmd_pending_until_ms = now_ms.wrapping_add(LORA_CMD_WINDOW_MS);
-        self.cmd_rx_buf.clear();
-        Ok(())
-    }
-
-    fn finalize_command_probe(&mut self) {
-        let hex = format_hex_bytes(&self.cmd_rx_buf);
-        self.cmd_last_ok = self.cmd_rx_buf.len() >= 3
-            && (self.cmd_rx_buf[0] == 0xC0 || self.cmd_rx_buf[0] == 0xC1 || self.cmd_rx_buf[0] == 0xC2);
-        self.cmd_last_hex = if hex.is_empty() { "-".to_string() } else { hex };
-        self.cmd_pending_until_ms = 0;
-    }
-
-    fn switch_to_next_baud(&mut self) -> Result<()> {
-        self.baud_index = (self.baud_index + 1) % LORA_BAUD_CANDIDATES.len();
-        let baud = self.current_baud();
-        self.uart.change_baudrate(Hertz(baud))?;
-        self.last_scan_note = format!("scan->{}", baud);
-        self.line_buf.clear();
-        Ok(())
     }
 
     pub fn tx_packets(&self) -> u32 {
@@ -247,16 +194,12 @@ impl<'d> LoRaTester<'d> {
         LORA_BAUD_CANDIDATES[self.baud_index]
     }
 
-    pub fn scan_note(&self) -> &str {
-        &self.last_scan_note
-    }
-
     pub fn ff_only_alert(&self) -> bool {
-        self.rx_bytes >= 6 && self.rx_non_ff_bytes == 0
+        self.rx_bytes >= 6 && self.rx_non_garbage_bytes == 0
     }
 
     pub fn cmd_probe_ok(&self) -> bool {
-        self.cmd_last_ok
+        false
     }
 
     pub fn cmd_probe_hex(&self) -> &str {
@@ -264,14 +207,25 @@ impl<'d> LoRaTester<'d> {
     }
 
     pub fn cmd_probe_status(&self) -> &'static str {
-        if self.cmd_pending_until_ms != 0 {
-            "pending"
-        } else if self.cmd_last_ok {
-            "ok"
-        } else {
-            "noresp"
-        }
+        "n/a"
     }
+
+    pub fn ping_seen(&self) -> u32 {
+        self.ping_seen
+    }
+
+    pub fn last_ping_seq(&self) -> Option<u16> {
+        self.last_ping_seq
+    }
+}
+
+fn parse_ping_seq(line: &str) -> Option<u16> {
+    let trimmed = line.trim();
+    let digits = trimmed.strip_prefix("ping #")?;
+    if digits.len() != 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u16>().ok()
 }
 
 fn format_hex_bytes(data: &[u8]) -> String {
@@ -328,7 +282,7 @@ pub fn draw_lora_test_values(
         &format!("UART2 RX18 TX17 Baud:{}", lora.current_baud()),
     )?;
     draw_line(panel, 48, "E220: Normal M0=0 M1=0")?;
-    draw_line(panel, 60, &format!("BaudScan: {}", lora.scan_note()))?;
+    draw_line(panel, 60, "RF peer: 915.125 SF7 BW125 CR4/5")?;
     draw_line(panel, 72, &format!("TX packets: {}", lora.tx_packets()))?;
     draw_line(panel, 84, &format!("TX bytes:   {}", lora.tx_bytes()))?;
     draw_line(panel, 96, &format!("RX bytes:   {}", lora.rx_bytes()))?;
@@ -339,7 +293,7 @@ pub fn draw_lora_test_values(
         &format!(
             "RX quality: {}",
             if lora.ff_only_alert() {
-                "ERROR only FF"
+                "ERROR only FE/FF"
             } else {
                 "OK"
             }
@@ -365,7 +319,18 @@ pub fn draw_lora_test_values(
         ),
     )?;
     draw_line(panel, 168, "CMD test needs M0=1 M1=1")?;
-    draw_line(panel, 180, &format!("SD: {}", truncate_chars(log_info, 30)))?;
-    draw_line(panel, 192, "Sendet alle 1s: PING x")?;
+    draw_line(
+        panel,
+        180,
+        &format!(
+            "PING rx:{} last:#{}",
+            lora.ping_seen(),
+            lora.last_ping_seq()
+                .map(|v| format!("{v:03}"))
+                .unwrap_or_else(|| "---".to_string())
+        ),
+    )?;
+    draw_line(panel, 192, &format!("SD: {}", truncate_chars(log_info, 30)))?;
+    draw_line(panel, 204, "Sendet alle 1s: ping #NNN")?;
     Ok(())
 }

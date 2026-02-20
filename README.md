@@ -47,8 +47,10 @@ cargo run
 - `LoRa Test`
   - UART2 LoRa diagnostic screen for EBYTE E220 modules.
   - Pin mapping on this project: `RX=GPIO18`, `TX=GPIO17`.
-  - Sends periodic `PING`, shows RX stats/hex, does baud scan (`9600/19200/38400/57600/115200`) when only `FF` bytes are seen.
-  - Periodic command probe (`C1 C1 C1`) with status output (`pending/ok/noresp`).
+  - Sends periodic `ping #NNN` at fixed UART settings (`9600 8N1`).
+  - RF peer profile shown in UI/logging: `915.125 MHz / SF7 / BW125 / CR4/5`.
+  - Shows RX stats/hex and console-style TX/RX status lines.
+  - No runtime baud scan and no `C1 C1 C1` config probing (requires wired `M0/M1`).
 - `SD Format`
   - SD mount + format + write/read `test.txt`.
   - Progress is shown on display in percent (`0%`..`100%`).
