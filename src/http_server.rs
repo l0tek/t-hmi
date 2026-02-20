@@ -170,7 +170,8 @@ fn handle_client(mut stream: TcpStream) -> Result<()> {
             let file_name = url_decode_component(raw_file);
             match crate::sdcard::read_sd_file(&file_name) {
                 Ok(data) => {
-                    let max = 64 * 1024usize;
+                    // Keep memory bounded on ESP32-S3 to avoid OOM in HTTP thread.
+                    let max = 16 * 1024usize;
                     let (slice, truncated) = if data.len() > max {
                         (&data[..max], true)
                     } else {
@@ -188,7 +189,7 @@ fn handle_client(mut stream: TcpStream) -> Result<()> {
                         url_encode_component(&file_name)
                     ));
                     if truncated {
-                        body.push_str("<article class=\"warning\">Datei ist gross, Anzeige auf 64 KiB begrenzt.</article>");
+                        body.push_str("<article class=\"warning\">Datei ist gross, Anzeige auf 16 KiB begrenzt.</article>");
                     }
                     body.push_str("<pre>");
                     body.push_str(&escape_html(&text));
@@ -279,6 +280,18 @@ fn render_dashboard_page() -> String {
     };
 
     let remote_status = crate::remote::get_status();
+    let battery_status = match crate::device::read_battery_once(crate::device::BAT_ADC_GPIO_DEFAULT)
+    {
+        Ok(status) => {
+            let source = match status.source {
+                crate::device::PowerSource::Usb => "USB",
+                crate::device::PowerSource::Battery => "Akku",
+                crate::device::PowerSource::Unknown => "Unbekannt",
+            };
+            format!("{} | {} mV | {} %", source, status.v_bat_mv, status.percent)
+        }
+        Err(_) => crate::remote::get_battery(),
+    };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>t-hmi Dashboard</title>\
@@ -288,7 +301,7 @@ fn render_dashboard_page() -> String {
          <nav><a href=\"/\" class=\"brand\">t-hmi</a><div class=\"menu\"><a href=\"/\">Dashboard</a><a href=\"/logs\">Logfiles</a><a href=\"/sd\">SD Karte</a></div></nav>\
          <section class=\"hero\"><h2>System Dashboard</h2><p>Status und Schnellzugriffe</p></section>\
          <section class=\"grid\">\
-           <article class=\"card\"><h3>Status</h3><p><b>HTTP:</b> Aktiv</p><p><b>IP:</b> {}</p><p><b>SD:</b> {}</p><p><b>Logfiles:</b> {}</p><p><b>Remote:</b> {}</p></article>\
+           <article class=\"card\"><h3>Status</h3><p><b>HTTP:</b> Aktiv</p><p><b>IP:</b> {}</p><p><b>SD:</b> {}</p><p><b>Logfiles:</b> {}</p><p><b>Batterie:</b> {}</p><p><b>Remote:</b> {}</p></article>\
            <article class=\"card cmd\"><h3>Navigation</h3>\
              <a class=\"button\" href=\"/api/cmd?cmd=goto_menu\">Main</a>\
              <a class=\"button\" href=\"/api/cmd?cmd=goto_wifi_menu\">WiFi</a>\
@@ -322,6 +335,7 @@ fn render_dashboard_page() -> String {
         escape_html(&ip),
         escape_html(&sd_state),
         escape_html(&logs_count),
+        escape_html(&battery_status),
         escape_html(&remote_status)
     )
 }
@@ -432,11 +446,18 @@ fn respond_download(stream: &mut TcpStream, file_name: &str, data: &[u8]) -> Res
 }
 
 fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    // Single-pass escaping avoids multiple large temporary allocations on device.
+    let mut out = String::with_capacity(input.len().saturating_add(32));
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn url_encode_component(input: &str) -> String {

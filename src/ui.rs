@@ -7,6 +7,7 @@ use embedded_graphics::{
     text::Text,
 };
 use esp_idf_sys as sys;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{FrameBuffer, LCD_H_RES, LCD_V_RES};
 
@@ -23,12 +24,14 @@ pub const HEADER_H: i32 = 30;
 pub const WIFI_MENU_BTN1_Y: i32 = 60;
 pub const WIFI_MENU_BTN2_Y: i32 = 100;
 pub const WIFI_MENU_BTN3_Y: i32 = 140;
-pub const DEVICE_MENU_BTN1_Y: i32 = 60;
-pub const DEVICE_MENU_BTN2_Y: i32 = 100;
-pub const DEVICE_MENU_BTN3_Y: i32 = 140;
-pub const DEVICE_MENU_BTN4_Y: i32 = 180;
-pub const DEVICE_MENU_BTN5_Y: i32 = 220;
-pub const DEVICE_MENU_BTN6_Y: i32 = 260;
+pub const DEVICE_MENU_BTN1_Y: i32 = 44;
+pub const DEVICE_MENU_BTN2_Y: i32 = 74;
+pub const DEVICE_MENU_BTN3_Y: i32 = 104;
+pub const DEVICE_MENU_BTN4_Y: i32 = 134;
+pub const DEVICE_MENU_BTN5_Y: i32 = 164;
+pub const DEVICE_MENU_BTN6_Y: i32 = 194;
+pub const DEVICE_MENU_BTN7_Y: i32 = 224;
+pub const DEVICE_MENU_BTN8_Y: i32 = 254;
 pub const HTTP_MENU_BTN1_Y: i32 = 80;
 pub const WIFI_CH_BTN_W: i32 = 28;
 pub const WIFI_CH_BTN_H: i32 = 22;
@@ -47,6 +50,10 @@ const CHANNEL_BAR_H: i32 = 170;
 
 const ICON_W: i32 = 16;
 const ICON_H: i32 = 16;
+const HEADER_STATUS_W: i32 = 48;
+
+static HEADER_WIFI_ON: AtomicBool = AtomicBool::new(false);
+static HEADER_HTTP_ON: AtomicBool = AtomicBool::new(false);
 
 const ICON_GPS: [u16; 16] = [
     0b0000000000000000,
@@ -125,6 +132,7 @@ const ICON_BATTERY: [u16; 16] = [
 ];
 
 pub struct BatteryLabels {
+    pub y_source: i32,
     pub y_vbat: i32,
     pub y_adc: i32,
     pub y_raw: i32,
@@ -148,8 +156,12 @@ pub fn draw_bitmap(
 }
 
 pub fn clear_screen(panel: sys::esp_lcd_panel_handle_t, color: Rgb565) -> Result<()> {
-    let buffer = vec![color.into_storage(); (LCD_H_RES * LCD_V_RES) as usize];
-    draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, &buffer)
+    // Avoid large heap allocations (~150 KB) on ESP32 by drawing line-by-line.
+    let line = [color.into_storage(); LCD_H_RES as usize];
+    for y in 0..LCD_V_RES {
+        draw_bitmap(panel, 0, y, LCD_H_RES, 1, &line)?;
+    }
+    Ok(())
 }
 
 pub fn draw_text_box(
@@ -266,12 +278,13 @@ pub fn draw_header(panel: sys::esp_lcd_panel_handle_t, title: &str, show_back: b
     } else {
         6
     };
-    let title_w = (LCD_H_RES - title_x - 1).max(0);
+    let title_w = (LCD_H_RES - title_x - HEADER_STATUS_W - 1).max(0);
     let title_y = 3;
     let title_h = 24;
     draw_text_box(
         panel, title_x, title_y, title_w, title_h, title, header_fg, header_bg,
     )?;
+    draw_header_status_icons(panel, header_bg)?;
     Ok(())
 }
 
@@ -282,7 +295,7 @@ pub fn draw_header_with_icon(
     icon: &[u16; 16],
 ) -> Result<()> {
     draw_header(panel, title, show_back)?;
-    let icon_x = LCD_H_RES - ICON_W - 6;
+    let icon_x = LCD_H_RES - HEADER_STATUS_W - ICON_W - 6;
     let icon_y = 7;
     let mut buffer = vec![Rgb565::new(24, 48, 24).into_storage(); (ICON_W * ICON_H) as usize];
     let mut fb = FrameBuffer {
@@ -292,6 +305,31 @@ pub fn draw_header_with_icon(
     };
     draw_icon_fb(&mut fb, 0, 0, Rgb565::BLACK, icon)?;
     draw_bitmap(panel, icon_x, icon_y, ICON_W, ICON_H, &buffer)
+}
+
+pub fn set_header_status_icons(wifi_on: bool, http_on: bool) {
+    HEADER_WIFI_ON.store(wifi_on, Ordering::Relaxed);
+    HEADER_HTTP_ON.store(http_on, Ordering::Relaxed);
+}
+
+fn draw_header_status_icons(panel: sys::esp_lcd_panel_handle_t, bg: Rgb565) -> Result<()> {
+    let wifi_fg = if HEADER_WIFI_ON.load(Ordering::Relaxed) {
+        Rgb565::new(0, 63, 0)
+    } else {
+        Rgb565::new(63, 0, 0)
+    };
+    let http_fg = if HEADER_HTTP_ON.load(Ordering::Relaxed) {
+        Rgb565::new(0, 63, 0)
+    } else {
+        Rgb565::new(63, 0, 0)
+    };
+
+    let wifi_x = LCD_H_RES - HEADER_STATUS_W + 2;
+    let http_x = LCD_H_RES - 22;
+    let y = 9;
+    draw_text_box_small(panel, wifi_x, y, 20, 12, "W", wifi_fg, bg)?;
+    draw_text_box_small(panel, http_x, y, 20, 12, "H", http_fg, bg)?;
+    Ok(())
 }
 
 fn draw_icon_fb(fb: &mut FrameBuffer, x: i32, y: i32, fg: Rgb565, rows: &[u16]) -> Result<()> {
@@ -496,7 +534,7 @@ pub fn draw_device_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
     draw_menu_line(
         panel,
         DEVICE_MENU_BTN3_Y,
-        "  UART Loopback",
+        "  LoRa Test",
         Rgb565::new(0, 63, 0),
         Rgb565::BLACK,
     )?;
@@ -518,6 +556,20 @@ pub fn draw_device_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
         panel,
         DEVICE_MENU_BTN6_Y,
         "  WiFi Login",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_menu_line(
+        panel,
+        DEVICE_MENU_BTN7_Y,
+        "  GPS Logging",
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_menu_line(
+        panel,
+        DEVICE_MENU_BTN8_Y,
+        "  LoRa Logging",
         Rgb565::new(0, 63, 0),
         Rgb565::BLACK,
     )?;
@@ -604,6 +656,9 @@ pub fn draw_battery_status_frame(panel: sys::esp_lcd_panel_handle_t) -> Result<B
     let fg = Rgb565::new(0, 63, 0);
     let mut y = 50;
     let line_h = 20;
+    draw_text_box(panel, 0, y, LCD_H_RES, line_h, "Quelle:", fg, Rgb565::BLACK)?;
+    let y_source = y;
+    y += line_h;
     draw_text_box(panel, 0, y, LCD_H_RES, line_h, "VBAT:", fg, Rgb565::BLACK)?;
     let y_vbat = y;
     y += line_h;
@@ -620,6 +675,7 @@ pub fn draw_battery_status_frame(panel: sys::esp_lcd_panel_handle_t) -> Result<B
     let y_cal = y;
 
     Ok(BatteryLabels {
+        y_source,
         y_vbat,
         y_adc,
         y_raw,
@@ -634,6 +690,21 @@ pub fn draw_battery_status_values(
     status: &crate::device::BatteryStatus,
 ) -> Result<()> {
     let fg = Rgb565::new(0, 63, 0);
+    let (source_text, source_fg) = match status.source {
+        crate::device::PowerSource::Usb => ("USB", Rgb565::new(0, 63, 0)),
+        crate::device::PowerSource::Battery => ("Akku", Rgb565::new(63, 63, 0)),
+        crate::device::PowerSource::Unknown => ("Unbekannt", Rgb565::new(63, 0, 0)),
+    };
+    draw_text_box(
+        panel,
+        70,
+        labels.y_source,
+        LCD_H_RES - 70,
+        20,
+        source_text,
+        source_fg,
+        Rgb565::BLACK,
+    )?;
     draw_text_box(
         panel,
         70,

@@ -21,6 +21,7 @@ use std::{
 pub mod device;
 pub mod gps;
 pub mod http_server;
+pub mod lora;
 pub mod remote;
 pub mod sdcard;
 pub mod ui;
@@ -34,9 +35,10 @@ use ui::{
     draw_wifi_message, draw_wifi_monitor, draw_wifi_screen, set_header_status_icons, BatteryLabels,
     PacketSample, RssiSeries, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, DEVICE_MENU_BTN1_Y,
     DEVICE_MENU_BTN2_Y, DEVICE_MENU_BTN3_Y, DEVICE_MENU_BTN4_Y, DEVICE_MENU_BTN5_Y,
-    DEVICE_MENU_BTN6_Y, HTTP_MENU_BTN1_Y, MENU_BTN1_Y, MENU_BTN2_Y, MENU_BTN_H, MENU_BTN_W,
-    MENU_BTN_X, WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X, WIFI_CH_BTN_RIGHT_X, WIFI_CH_BTN_W,
-    WIFI_CH_BTN_Y, WIFI_MENU_BTN1_Y, WIFI_MENU_BTN2_Y, WIFI_MENU_BTN3_Y,
+    DEVICE_MENU_BTN6_Y, DEVICE_MENU_BTN7_Y, DEVICE_MENU_BTN8_Y, HTTP_MENU_BTN1_Y, MENU_BTN1_Y,
+    MENU_BTN2_Y, MENU_BTN_H, MENU_BTN_W, MENU_BTN_X, WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X,
+    WIFI_CH_BTN_RIGHT_X, WIFI_CH_BTN_W, WIFI_CH_BTN_Y, WIFI_MENU_BTN1_Y, WIFI_MENU_BTN2_Y,
+    WIFI_MENU_BTN3_Y,
 };
 
 pub const LCD_H_RES: i32 = 240;
@@ -52,9 +54,8 @@ const TOUCH_MISO: i32 = 4;
 const TOUCH_MOSI: i32 = 3;
 const TOUCH_CS: i32 = 2;
 const TOUCH_IRQ: i32 = 9;
-// BAT_ADC shares IO03 with LCD_MOSI/Touch MOSI on this board.
-// We only read at boot and when entering the BatteryStatus screen.
-const BAT_ADC_GPIO: i32 = 3;
+// Board reference examples use BAT_ADC on GPIO5.
+const BAT_ADC_GPIO: i32 = 5;
 const PWR_EN_GPIO: i32 = 10;
 const PWR_ON_GPIO: i32 = 14;
 const BL_GPIO: i32 = 38;
@@ -202,6 +203,18 @@ fn connect_default_sequence(
         defaults.len(),
         errors.join(" | ")
     ))
+}
+
+fn format_battery_dashboard(status: Option<&device::BatteryStatus>) -> String {
+    let Some(status) = status else {
+        return "ADC disabled/NA".to_string();
+    };
+    let source = match status.source {
+        device::PowerSource::Usb => "USB",
+        device::PowerSource::Battery => "Akku",
+        device::PowerSource::Unknown => "Unbekannt",
+    };
+    format!("{} | {} mV | {} %", source, status.v_bat_mv, status.percent)
 }
 
 fn enter_deep_sleep() -> ! {
@@ -682,6 +695,9 @@ enum Screen {
     WifiChannelMonitor,
     Gps,
     UartLoopback,
+    LoRaTest,
+    GpsLogging,
+    LoRaLogging,
     DeviceMenu,
     BatteryStatus,
     SdCardFormat,
@@ -706,6 +722,7 @@ const CHANNEL_MAX: u8 = 13;
 const CHANNEL_SAMPLE_MAX: usize = 60;
 const CHANNEL_SAMPLE_INTERVAL_MS: u32 = 500;
 const GPS_LOG_INTERVAL_MS: u32 = 200;
+const LORA_LOG_INTERVAL_MS: u32 = 250;
 const WIFI_LOGIN_LINE_Y: i32 = 52;
 const WIFI_LOGIN_LINE_H: i32 = 18;
 const WIFI_LOGIN_MAX_ITEMS: usize = 4;
@@ -1090,24 +1107,26 @@ impl GpsSdLogger {
         Self::current_unix_secs_system().unwrap_or(0)
     }
 
-    fn make_file_name(unix_secs: u64) -> String {
+    fn make_file_name(unix_secs: u64, run_id: u32) -> String {
         let (year, month, day, hour, minute, second) = unix_to_utc_ymdhms(unix_secs);
-        format!("gpslog_{year:04}{month:02}{day:02}_{hour:02}{minute:02}{second:02}.txt")
+        format!("gps_{year:04}{month:02}{day:02}_{hour:02}{minute:02}{second:02}_{run_id:08}.txt")
     }
 
-    fn make_file_name_83(unix_secs: u64) -> String {
+    fn make_file_name_83(unix_secs: u64, run_id: u32) -> String {
         // 8.3 fallback for FAT configurations without long file names.
-        // Name is DDHHMMSS + ".txt" (8 chars base + 3 chars ext).
-        let (_year, _month, day, hour, minute, second) = unix_to_utc_ymdhms(unix_secs);
-        format!("{day:02}{hour:02}{minute:02}{second:02}.txt")
+        // Name is G + DDHHMM + N + ".txt" (8 chars base + 3 chars ext).
+        let (_year, _month, day, hour, minute, _second) = unix_to_utc_ymdhms(unix_secs);
+        let n = run_id % 10;
+        format!("g{day:02}{hour:02}{minute:02}{n}.txt")
     }
 
     fn start(&mut self, now_ms: u32, gps: &gps::GpsReader<'_>) -> Result<()> {
         self.stop();
         let session = sdcard::SdCardSession::mount()?;
         let unix_secs = Self::resolve_unix_secs(gps);
-        let long_file_name = Self::make_file_name(unix_secs);
-        let short_file_name = Self::make_file_name_83(unix_secs);
+        let run_id = now_ms;
+        let long_file_name = Self::make_file_name(unix_secs, run_id);
+        let short_file_name = Self::make_file_name_83(unix_secs, run_id);
         let file_name = match session.append_line(
             &long_file_name,
             "ts_ms;fix;sats;lat;lon;baud;raw_bps;last_nmea",
@@ -1139,6 +1158,14 @@ impl GpsSdLogger {
         self.session = None;
         self.file_name = None;
         self.last_log_ms = 0;
+    }
+
+    fn is_active(&self) -> bool {
+        self.session.is_some() && self.file_name.is_some()
+    }
+
+    fn file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
     }
 
     fn poll_log(&mut self, now_ms: u32, gps: &gps::GpsReader<'_>) {
@@ -1185,6 +1212,313 @@ impl GpsSdLogger {
             self.stop();
         }
     }
+}
+
+struct LoraSdLogger {
+    session: Option<sdcard::SdCardSession>,
+    file_name: Option<String>,
+    last_log_ms: u32,
+}
+
+impl LoraSdLogger {
+    fn new() -> Self {
+        Self {
+            session: None,
+            file_name: None,
+            last_log_ms: 0,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.session.is_some() && self.file_name.is_some()
+    }
+
+    fn file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
+    }
+
+    fn current_unix_secs_system() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn make_file_name(unix_secs: u64, run_id: u32) -> String {
+        let (year, month, day, hour, minute, second) = unix_to_utc_ymdhms(unix_secs);
+        format!("lora_{year:04}{month:02}{day:02}_{hour:02}{minute:02}{second:02}_{run_id:08}.txt")
+    }
+
+    fn make_file_name_83(unix_secs: u64, run_id: u32) -> String {
+        let (_year, _month, day, hour, minute, _second) = unix_to_utc_ymdhms(unix_secs);
+        let n = run_id % 10;
+        format!("l{day:02}{hour:02}{minute:02}{n}.txt")
+    }
+
+    fn start(&mut self, now_ms: u32) -> Result<()> {
+        self.stop();
+        let session = sdcard::SdCardSession::mount()?;
+        let unix_secs = Self::current_unix_secs_system();
+        let run_id = now_ms;
+        let long_file_name = Self::make_file_name(unix_secs, run_id);
+        let short_file_name = Self::make_file_name_83(unix_secs, run_id);
+        let file_name = match session.append_line(
+            &long_file_name,
+            "ts_ms;baud;tx_packets;tx_bytes;rx_bytes;rx_lines;ff_only;cmd_status;cmd_hex;last_line;rx_hex",
+        ) {
+            Ok(()) => long_file_name,
+            Err(err) => {
+                println!(
+                    "[LORA_LOG] long filename failed ({}), fallback to /sdcard/{}",
+                    err, short_file_name
+                );
+                session.append_line(
+                    &short_file_name,
+                    "ts_ms;baud;tx_packets;tx_bytes;rx_bytes;rx_lines;ff_only;cmd_status;cmd_hex;last_line;rx_hex",
+                )?;
+                short_file_name
+            }
+        };
+        println!("[LORA_LOG] start file=/sdcard/{}", file_name);
+        self.session = Some(session);
+        self.file_name = Some(file_name);
+        self.last_log_ms = now_ms.wrapping_sub(LORA_LOG_INTERVAL_MS);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        if let Some(file_name) = self.file_name.as_deref() {
+            println!("[LORA_LOG] close file=/sdcard/{}", file_name);
+        }
+        self.session = None;
+        self.file_name = None;
+        self.last_log_ms = 0;
+    }
+
+    fn poll_log(&mut self, now_ms: u32, lora: &lora::LoRaTester<'_>) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let Some(file_name) = self.file_name.as_deref() else {
+            return;
+        };
+        if now_ms.wrapping_sub(self.last_log_ms) < LORA_LOG_INTERVAL_MS {
+            return;
+        }
+        self.last_log_ms = now_ms;
+        let last_line = lora
+            .last_line()
+            .replace(';', ",")
+            .replace('\r', " ")
+            .replace('\n', " ");
+        let cmd_hex = lora.cmd_probe_hex().replace(';', ",");
+        let rx_hex = lora.recent_hex().replace(';', ",");
+        let line = format!(
+            "{};{};{};{};{};{};{};{};{};{};{}",
+            now_ms,
+            lora.current_baud(),
+            lora.tx_packets(),
+            lora.tx_bytes(),
+            lora.rx_bytes(),
+            lora.rx_lines(),
+            if lora.ff_only_alert() { 1 } else { 0 },
+            lora.cmd_probe_status(),
+            cmd_hex,
+            last_line,
+            rx_hex
+        );
+        if let Err(err) = session.append_line(file_name, &line) {
+            println!("[LORA_LOG] write failed: {}", err);
+            self.stop();
+        }
+    }
+}
+
+fn format_lora_log_info(logger: &LoraSdLogger) -> String {
+    if let Some(file_name) = logger.file_name() {
+        return format!("LOG on /sdcard/{}", file_name);
+    }
+    "LOG off".to_string()
+}
+
+fn draw_logging_screen(
+    panel: sys::esp_lcd_panel_handle_t,
+    title: &str,
+    enabled: bool,
+    file_name: Option<&str>,
+) -> Result<()> {
+    clear_screen(panel, Rgb565::BLACK)?;
+    draw_header(panel, title, true)?;
+    draw_text_box(
+        panel,
+        MENU_BTN_X,
+        90,
+        MENU_BTN_W,
+        28,
+        if enabled {
+            "Stop Logging"
+        } else {
+            "Start Logging"
+        },
+        if enabled {
+            Rgb565::new(63, 16, 0)
+        } else {
+            Rgb565::new(0, 63, 0)
+        },
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        136,
+        LCD_H_RES,
+        12,
+        if enabled { "Status: ON" } else { "Status: OFF" },
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    let file = file_name.unwrap_or("-");
+    draw_text_box_small(
+        panel,
+        0,
+        152,
+        LCD_H_RES,
+        12,
+        &format!("File: {}", truncate_chars(file, 34)),
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    Ok(())
+}
+
+fn draw_gps_logging_screen(
+    panel: sys::esp_lcd_panel_handle_t,
+    enabled: bool,
+    file_name: Option<&str>,
+    gps: &gps::GpsReader<'_>,
+) -> Result<()> {
+    draw_logging_screen(panel, "GPS Logging", enabled, file_name)?;
+    let sats = gps
+        .sats()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let lat = gps
+        .lat()
+        .map(|v| format!("{:.6}", v))
+        .unwrap_or_else(|| "-".to_string());
+    let lon = gps
+        .lon()
+        .map(|v| format!("{:.6}", v))
+        .unwrap_or_else(|| "-".to_string());
+    draw_text_box_small(
+        panel,
+        0,
+        178,
+        LCD_H_RES,
+        12,
+        &format!(
+            "Fix:{} Sats:{} Baud:{}",
+            if gps.fix() { 1 } else { 0 },
+            sats,
+            gps.current_baud()
+        ),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        194,
+        LCD_H_RES,
+        12,
+        &format!(
+            "Lat:{} Lon:{}",
+            truncate_chars(&lat, 10),
+            truncate_chars(&lon, 10)
+        ),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        210,
+        LCD_H_RES,
+        12,
+        &format!(
+            "RawBps:{} Last:{}",
+            gps.raw_bytes_per_sec(),
+            truncate_chars(gps.last_sentence(), 16)
+        ),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    Ok(())
+}
+
+fn draw_lora_logging_screen(
+    panel: sys::esp_lcd_panel_handle_t,
+    enabled: bool,
+    file_name: Option<&str>,
+    lora: &lora::LoRaTester<'_>,
+) -> Result<()> {
+    draw_logging_screen(panel, "LoRa Logging", enabled, file_name)?;
+    draw_text_box_small(
+        panel,
+        0,
+        178,
+        LCD_H_RES,
+        12,
+        &format!(
+            "TX pkt:{} TX bytes:{} baud:{}",
+            lora.tx_packets(),
+            lora.tx_bytes(),
+            lora.current_baud()
+        ),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        194,
+        LCD_H_RES,
+        12,
+        &format!(
+            "RX bytes:{} RX lines:{} ff:{}",
+            lora.rx_bytes(),
+            lora.rx_lines(),
+            if lora.ff_only_alert() { "ERR" } else { "OK" }
+        ),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        210,
+        LCD_H_RES,
+        12,
+        &format!(
+            "CMD {} {}",
+            lora.cmd_probe_status(),
+            truncate_chars(lora.cmd_probe_hex(), 24)
+        ),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    draw_text_box_small(
+        panel,
+        0,
+        226,
+        LCD_H_RES,
+        12,
+        &format!("Last:{}", truncate_chars(lora.last_line(), 30)),
+        Rgb565::new(0, 63, 0),
+        Rgb565::BLACK,
+    )?;
+    Ok(())
 }
 
 fn ntp_sync_time(timeout_ms: u32) -> Result<bool> {
@@ -1288,12 +1622,13 @@ fn main() -> Result<()> {
     bl.set_high()?;
     power_btn.set_pull(Pull::Down)?;
 
-    // Read battery before LCD init since BAT_ADC shares IO03 with LCD_MOSI.
-    let battery_cache = if BAT_ADC_GPIO >= 0 {
+    // Read battery once at boot for dashboard and battery screen.
+    let mut battery_cache = if BAT_ADC_GPIO >= 0 {
         read_battery_once(BAT_ADC_GPIO).ok()
     } else {
         None
     };
+    remote::set_battery(format_battery_dashboard(battery_cache.as_ref()));
 
     let panel = init_lcd()?;
     set_header_status_icons(false, false);
@@ -1342,6 +1677,10 @@ fn main() -> Result<()> {
     let mut gps_reader = gps::GpsReader::new(p.uart1, p.pins.gpio16, p.pins.gpio15)?;
     let mut gps_sd_logger = GpsSdLogger::new();
     push_boot_log(panel, &mut boot_logs, "GPS OK")?;
+    push_boot_log(panel, &mut boot_logs, "Init LoRa UART...")?;
+    let mut lora_tester = lora::LoRaTester::new(p.uart2, p.pins.gpio17, p.pins.gpio18)?;
+    let mut lora_sd_logger = LoraSdLogger::new();
+    push_boot_log(panel, &mut boot_logs, "LoRa UART OK")?;
     let default_wifi = wifi_default_networks();
     let default_primary_ssid = default_wifi
         .first()
@@ -1368,6 +1707,9 @@ fn main() -> Result<()> {
     let mut gps_last_redraw: u32 = 0;
     let mut gps_back_to_device = false;
     let mut loopback_last_redraw: u32 = 0;
+    let mut lora_last_redraw: u32 = 0;
+    let mut gps_log_last_redraw: u32 = 0;
+    let mut lora_log_last_redraw: u32 = 0;
     let mut http_server: Option<http_server::MiniHttpServer> = None;
     let mut http_status = String::from("Aus");
     let mut wifi_login_items: Vec<wifi::WifiAp> = Vec::new();
@@ -1376,6 +1718,8 @@ fn main() -> Result<()> {
     let mut wifi_login_status = String::from("Scan und Netz waehlen");
     let mut wifi_login_password = default_primary_password.clone();
     let mut wifi_login_char_idx: usize = 0;
+    let mut gps_log_background = false;
+    let mut lora_log_background = false;
     if !default_wifi.is_empty() {
         push_boot_log(
             panel,
@@ -1462,16 +1806,24 @@ fn main() -> Result<()> {
                     gps_back_to_device = true;
                     gps_last_redraw = tick_ms;
                     gps_reader.set_host_log_enabled(true);
-                    if let Err(err) = gps_sd_logger.start(tick_ms, &gps_reader) {
-                        remote::set_status(format!("error: gps log start: {}", err));
-                    } else {
-                        gps::draw_gps_frame(panel)?;
-                        gps::draw_gps_values(panel, &gps_reader)?;
-                        remote::set_status("ok: gps");
+                    if !gps_sd_logger.is_active() {
+                        if let Err(err) = gps_sd_logger.start(tick_ms, &gps_reader) {
+                            remote::set_status(format!("error: gps log start: {}", err));
+                            continue;
+                        }
                     }
+                    gps::draw_gps_frame(panel)?;
+                    gps::draw_gps_values(panel, &gps_reader)?;
+                    remote::set_status("ok: gps");
                 }
                 remote::RemoteCommand::GotoBattery => {
                     screen = Screen::BatteryStatus;
+                    battery_cache = if BAT_ADC_GPIO >= 0 {
+                        read_battery_once(BAT_ADC_GPIO).ok()
+                    } else {
+                        None
+                    };
+                    remote::set_battery(format_battery_dashboard(battery_cache.as_ref()));
                     battery_last_read = 0;
                     battery_ignore_back_until = tick_ms.wrapping_add(1200);
                     battery_ignore_back = true;
@@ -1775,6 +2127,22 @@ fn main() -> Result<()> {
             }
             was_pressed = false;
         }
+        if !lora_log_background && !matches!(screen, Screen::LoRaTest) && lora_sd_logger.is_active()
+        {
+            lora_sd_logger.stop();
+        }
+        if !gps_log_background && !matches!(screen, Screen::Gps) && gps_sd_logger.is_active() {
+            gps_sd_logger.stop();
+        }
+
+        if gps_log_background && !matches!(screen, Screen::Gps | Screen::UartLoopback) {
+            let _ = gps_reader.poll(tick_ms)?;
+            gps_sd_logger.poll_log(tick_ms, &gps_reader);
+        }
+        if lora_log_background && !matches!(screen, Screen::LoRaTest) {
+            let _ = lora_tester.poll(tick_ms)?;
+            lora_sd_logger.poll_log(tick_ms, &lora_tester);
+        }
 
         let power_btn_raw = power_btn.is_high();
         if power_btn_raw && !power_btn_last_raw {
@@ -2047,11 +2415,27 @@ fn main() -> Result<()> {
                     && x < MENU_BTN_X + MENU_BTN_W
                     && y >= DEVICE_MENU_BTN6_Y
                     && y < DEVICE_MENU_BTN6_Y + MENU_BTN_H;
+                let hit_gps_log = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= DEVICE_MENU_BTN7_Y
+                    && y < DEVICE_MENU_BTN7_Y + MENU_BTN_H;
+                let hit_lora_log = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= DEVICE_MENU_BTN8_Y
+                    && y < DEVICE_MENU_BTN8_Y + MENU_BTN_H;
                 if hit_back && !was_pressed {
                     screen = Screen::Menu;
                     draw_menu(panel)?;
                 } else if hit_batt && !was_pressed {
                     screen = Screen::BatteryStatus;
+                    battery_cache = if BAT_ADC_GPIO >= 0 {
+                        read_battery_once(BAT_ADC_GPIO).ok()
+                    } else {
+                        None
+                    };
+                    remote::set_battery(format_battery_dashboard(battery_cache.as_ref()));
                     battery_last_read = 0;
                     battery_ignore_back_until = tick_ms.wrapping_add(1200);
                     battery_ignore_back = true;
@@ -2061,18 +2445,28 @@ fn main() -> Result<()> {
                     gps_back_to_device = true;
                     gps_last_redraw = tick_ms;
                     gps_reader.set_host_log_enabled(true);
-                    if let Err(err) = gps_sd_logger.start(tick_ms, &gps_reader) {
-                        println!("[GPS_LOG] start failed: {}", err);
+                    if !gps_sd_logger.is_active() {
+                        if let Err(err) = gps_sd_logger.start(tick_ms, &gps_reader) {
+                            println!("[GPS_LOG] start failed: {}", err);
+                        }
                     }
                     gps::draw_gps_frame(panel)?;
                     gps::draw_gps_values(panel, &gps_reader)?;
                 } else if hit_loopback && !was_pressed {
-                    screen = Screen::UartLoopback;
-                    gps_reader.set_host_log_enabled(false);
-                    gps_reader.loopback_reset();
-                    loopback_last_redraw = tick_ms;
-                    gps::draw_uart_loopback_frame(panel)?;
-                    gps::draw_uart_loopback_values(panel, &gps_reader)?;
+                    screen = Screen::LoRaTest;
+                    lora_tester.reset();
+                    if !lora_sd_logger.is_active() {
+                        if let Err(err) = lora_sd_logger.start(tick_ms) {
+                            println!("[LORA_LOG] start failed: {}", err);
+                        }
+                    }
+                    lora_last_redraw = tick_ms;
+                    lora::draw_lora_test_frame(panel)?;
+                    lora::draw_lora_test_values(
+                        panel,
+                        &lora_tester,
+                        &format_lora_log_info(&lora_sd_logger),
+                    )?;
                 } else if hit_sd_format && !was_pressed {
                     screen = Screen::SdCardFormat;
                     clear_screen(panel, Rgb565::BLACK)?;
@@ -2225,6 +2619,24 @@ fn main() -> Result<()> {
                         &wifi_login_password,
                         wifi_login_char_idx,
                     )?;
+                } else if hit_gps_log && !was_pressed {
+                    screen = Screen::GpsLogging;
+                    gps_log_last_redraw = tick_ms;
+                    draw_gps_logging_screen(
+                        panel,
+                        gps_log_background,
+                        gps_sd_logger.file_name(),
+                        &gps_reader,
+                    )?;
+                } else if hit_lora_log && !was_pressed {
+                    screen = Screen::LoRaLogging;
+                    lora_log_last_redraw = tick_ms;
+                    draw_lora_logging_screen(
+                        panel,
+                        lora_log_background,
+                        lora_sd_logger.file_name(),
+                        &lora_tester,
+                    )?;
                 }
                 was_pressed = hit_back
                     || hit_batt
@@ -2232,7 +2644,9 @@ fn main() -> Result<()> {
                     || hit_loopback
                     || hit_sd_format
                     || hit_http_menu
-                    || hit_wifi_login;
+                    || hit_wifi_login
+                    || hit_gps_log
+                    || hit_lora_log;
             }
             Screen::Gps => {
                 let hit_back = touch_down
@@ -2242,7 +2656,9 @@ fn main() -> Result<()> {
                     && y < BACK_BTN_Y + BACK_BTN_H;
                 if hit_back && !was_pressed {
                     gps_reader.set_host_log_enabled(false);
-                    gps_sd_logger.stop();
+                    if !gps_log_background {
+                        gps_sd_logger.stop();
+                    }
                     if gps_back_to_device {
                         screen = Screen::DeviceMenu;
                         draw_device_menu(panel)?;
@@ -2277,6 +2693,138 @@ fn main() -> Result<()> {
                     }
                 }
                 was_pressed = hit_back;
+            }
+            Screen::LoRaTest => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                if hit_back && !was_pressed {
+                    if !lora_log_background {
+                        lora_sd_logger.stop();
+                    }
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
+                } else {
+                    let changed = lora_tester.poll(tick_ms)?;
+                    lora_sd_logger.poll_log(tick_ms, &lora_tester);
+                    if changed || tick_ms.wrapping_sub(lora_last_redraw) >= 300 {
+                        lora::draw_lora_test_values(
+                            panel,
+                            &lora_tester,
+                            &format_lora_log_info(&lora_sd_logger),
+                        )?;
+                        lora_last_redraw = tick_ms;
+                    }
+                }
+                was_pressed = hit_back;
+            }
+            Screen::GpsLogging => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                let hit_toggle = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= 90
+                    && y < 118;
+                if hit_back && !was_pressed {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
+                } else if hit_toggle && !was_pressed {
+                    if gps_log_background {
+                        gps_log_background = false;
+                        if !matches!(screen, Screen::Gps) {
+                            gps_sd_logger.stop();
+                        }
+                        remote::set_status("ok: gps_log off");
+                    } else {
+                        gps_log_background = true;
+                        if !gps_sd_logger.is_active() {
+                            match gps_sd_logger.start(tick_ms, &gps_reader) {
+                                Ok(()) => remote::set_status("ok: gps_log on"),
+                                Err(err) => {
+                                    gps_log_background = false;
+                                    remote::set_status(format!("error: gps_log start: {}", err));
+                                }
+                            }
+                        } else {
+                            remote::set_status("ok: gps_log on");
+                        }
+                    }
+                    draw_gps_logging_screen(
+                        panel,
+                        gps_log_background,
+                        gps_sd_logger.file_name(),
+                        &gps_reader,
+                    )?;
+                    gps_log_last_redraw = tick_ms;
+                } else if tick_ms.wrapping_sub(gps_log_last_redraw) >= 300 {
+                    draw_gps_logging_screen(
+                        panel,
+                        gps_log_background,
+                        gps_sd_logger.file_name(),
+                        &gps_reader,
+                    )?;
+                    gps_log_last_redraw = tick_ms;
+                }
+                was_pressed = hit_back || hit_toggle;
+            }
+            Screen::LoRaLogging => {
+                let hit_back = touch_down
+                    && x >= BACK_BTN_X
+                    && x < BACK_BTN_X + BACK_BTN_W
+                    && y >= BACK_BTN_Y
+                    && y < BACK_BTN_Y + BACK_BTN_H;
+                let hit_toggle = touch_down
+                    && x >= MENU_BTN_X
+                    && x < MENU_BTN_X + MENU_BTN_W
+                    && y >= 90
+                    && y < 118;
+                if hit_back && !was_pressed {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
+                } else if hit_toggle && !was_pressed {
+                    if lora_log_background {
+                        lora_log_background = false;
+                        if !matches!(screen, Screen::LoRaTest) {
+                            lora_sd_logger.stop();
+                        }
+                        remote::set_status("ok: lora_log off");
+                    } else {
+                        lora_log_background = true;
+                        if !lora_sd_logger.is_active() {
+                            match lora_sd_logger.start(tick_ms) {
+                                Ok(()) => remote::set_status("ok: lora_log on"),
+                                Err(err) => {
+                                    lora_log_background = false;
+                                    remote::set_status(format!("error: lora_log start: {}", err));
+                                }
+                            }
+                        } else {
+                            remote::set_status("ok: lora_log on");
+                        }
+                    }
+                    draw_lora_logging_screen(
+                        panel,
+                        lora_log_background,
+                        lora_sd_logger.file_name(),
+                        &lora_tester,
+                    )?;
+                    lora_log_last_redraw = tick_ms;
+                } else if tick_ms.wrapping_sub(lora_log_last_redraw) >= 300 {
+                    draw_lora_logging_screen(
+                        panel,
+                        lora_log_background,
+                        lora_sd_logger.file_name(),
+                        &lora_tester,
+                    )?;
+                    lora_log_last_redraw = tick_ms;
+                }
+                was_pressed = hit_back || hit_toggle;
             }
             Screen::BatteryStatus => {
                 if battery_ignore_back && !touch_down {

@@ -41,31 +41,40 @@ cargo run
 
 ### Device Menu
 - `Batteriestatus`
-  - Live VBAT/ADC/raw/SoC/calibration display.
+  - Live power source + voltage + percent (`USB` / `Akku` / `Unbekannt`).
 - `GPS`
   - GPS values view (fix/sats/lat/lon + diagnostics).
-  - While GPS screen is open, samples are logged to SD as `/sdcard/gpslog_YYYYMMDD_HHMMSS.txt`.
-  - Logging stops automatically when leaving the GPS screen.
-- `UART Loopback`
-  - UART send/receive loopback diagnostics.
+- `LoRa Test`
+  - UART2 LoRa diagnostic screen for EBYTE E220 modules.
+  - Pin mapping on this project: `RX=GPIO18`, `TX=GPIO17`.
+  - Sends periodic `PING`, shows RX stats/hex, does baud scan (`9600/19200/38400/57600/115200`) when only `FF` bytes are seen.
+  - Periodic command probe (`C1 C1 C1`) with status output (`pending/ok/noresp`).
 - `SD Format`
   - SD mount + format + write/read `test.txt`.
   - Progress is shown on display in percent (`0%`..`100%`).
   - Result screen stays visible until Back button is pressed.
-- `HTTP SD`
+- `Mini HTTP`
   - Mini HTTP server submenu to expose SD card content and remote control over WiFi.
   - Start/Stop from UI (`http://<IP>:8080/`).
   - Requires active STA WiFi connection with valid IPv4.
 - `WiFi Login`
   - Scan/select AP, password input on device, connect from UI.
   - `Default` button tries all default credentials from `wifi_secrets.local` in order.
-  - Connection strategy prefers direct SSID connect (`wifi_connect`) and falls back to AP-pinned connect (`wifi_connect_ap`) if needed.
-  - After successful connect, a dedicated `WiFi Verbunden` screen shows:
-  - SSID, channel, RSSI, IPv4 address.
+- `GPS Logging`
+  - Separate screen with logging toggle/status.
+  - Can keep logging in background while using other screens.
+- `LoRa Logging`
+  - Separate screen with logging toggle/status.
+  - Can keep logging in background while using other screens.
 
 ### Header Status Icons
 - Header shows `W` (WiFi) and `H` (HTTPD) status icons on all screens.
 - Green = active, red = inactive.
+
+## SD Log Files
+- GPS logs: `gps_YYYYMMDD_HHMMSS_<runid>.txt`
+- LoRa logs: `lora_YYYYMMDD_HHMMSS_<runid>.txt`
+- If long filenames are not available on SD/FAT, firmware falls back to short 8.3 names.
 
 ## HTTP Dashboard
 1. On boot, firmware automatically tries default WiFi credentials from `wifi_secrets.local` in order.
@@ -75,7 +84,7 @@ cargo run
    - `/` Dashboard (status + command buttons)
    - `/logs` Logfile list (view/download)
    - `/sd` SD card explorer
-   - `/sd/view?file=<name>` direct text preview (truncated for large files)
+   - `/sd/view?file=<name>` direct text preview (truncated to 16 KiB)
    - `/sd/download?file=<name>` direct download
 
 ## HTTP Remote Commands
@@ -110,7 +119,7 @@ Use with care: these commands control live UI/workflows on the device.
 ## Time Source
 - Preferred: NTP (`pool.ntp.org`) after WLAN connect.
 - Fallback: GPS time from NMEA (`RMC` / `ZDA`).
-- This time is used for GPS logfile naming.
+- This time is used for GPS/LoRa logfile naming.
 
 ## WiFi Default Credentials
 Default credentials are injected at build time from `wifi_secrets.local`
@@ -146,17 +155,24 @@ Only GPS diagnostics:
 tio /dev/ttyACM0 -b 115200 | stdbuf -oL grep '^\[GPS\]'
 ```
 
-GPS host logs are only active while UI is on `Device -> GPS`.
+Only LoRa diagnostics:
+
+```bash
+tio /dev/ttyACM0 -b 115200 | stdbuf -oL grep '^\[LORA_LOG\]'
+```
 
 ## Project Structure
-- `src/main.rs`: app state machine and screen navigation
+- `src/main.rs`: app state machine, screen navigation, GPS/LoRa SD logging
 - `src/ui.rs`: drawing/layout for all screens
 - `src/wifi.rs`: WiFi init, scan, monitor, channel/promiscuous capture, connect helpers
-- `src/device.rs`: battery readout logic
-- `src/gps.rs`: GPS reader and UART loopback logic
+- `src/device.rs`: battery readout and source detection logic
+- `src/gps.rs`: GPS reader + UART loopback helpers
+- `src/lora.rs`: LoRa tester (UART2 diagnostics)
 - `src/sdcard.rs`: SD mount/format/test flow
-- `src/http_server.rs`: mini HTTP server for SD browse/download
+- `src/http_server.rs`: mini HTTP server for dashboard/SD browse/download
+- `src/remote.rs`: remote command queue/status bridge (HTTP -> UI loop)
 
 ## Notes
 - Defaults/config: `sdkconfig.defaults`
 - Build helper: `build.rs` (reads `wifi_secrets.local` and sets `WIFI_DEFAULT_*`)
+- Long FAT filenames require FATFS LFN options enabled in sdkconfig.

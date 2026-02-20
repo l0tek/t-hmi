@@ -32,6 +32,11 @@ fn status() -> &'static Mutex<String> {
     S.get_or_init(|| Mutex::new(String::from("idle")))
 }
 
+fn battery() -> &'static Mutex<String> {
+    static B: OnceLock<Mutex<String>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(String::from("n/a")))
+}
+
 pub fn enqueue(cmd: RemoteCommand) -> Result<()> {
     let mut q = queue()
         .lock()
@@ -62,4 +67,17 @@ pub fn get_status() -> String {
         .lock()
         .map(|s| s.clone())
         .unwrap_or_else(|_| "status unavailable".to_string())
+}
+
+pub fn set_battery(msg: impl Into<String>) {
+    if let Ok(mut b) = battery().lock() {
+        *b = msg.into();
+    }
+}
+
+pub fn get_battery() -> String {
+    battery()
+        .lock()
+        .map(|b| b.clone())
+        .unwrap_or_else(|_| "battery unavailable".to_string())
 }

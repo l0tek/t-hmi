@@ -2,9 +2,24 @@ use anyhow::{anyhow, Result};
 use esp_idf_sys as sys;
 use std::ptr;
 
-pub const BATTERY_DIVIDER_SCALE: f32 = 3.0;
+unsafe extern "C" {
+    fn usb_serial_jtag_is_connected() -> bool;
+}
+
+pub const BATTERY_DIVIDER_SCALE: f32 = 2.0;
 pub const BATTERY_EMPTY_V: f32 = 3.30;
 pub const BATTERY_FULL_V: f32 = 4.20;
+pub const BAT_ADC_GPIO_DEFAULT: i32 = 5;
+const BATTERY_PLAUSIBLE_MIN_MV: i32 = 2800;
+const BATTERY_PLAUSIBLE_MAX_MV: i32 = 4300;
+const USB_SUPPLY_MIN_MV: i32 = 4350;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PowerSource {
+    Battery,
+    Usb,
+    Unknown,
+}
 
 pub struct BatteryStatus {
     pub raw: i32,
@@ -12,6 +27,7 @@ pub struct BatteryStatus {
     pub v_bat_mv: i32,
     pub percent: u8,
     pub calibrated: bool,
+    pub source: PowerSource,
 }
 
 pub struct BatteryReader {
@@ -78,12 +94,14 @@ impl BatteryReader {
         let v_bat_mv = (v_adc_mv as f32 * BATTERY_DIVIDER_SCALE) as i32;
         let v_bat_v = v_bat_mv as f32 / 1000.0;
         let percent = battery_percent(v_bat_v);
+        let source = detect_power_source(v_bat_mv, usb_serial_jtag_connected());
         Ok(BatteryStatus {
             raw,
             v_adc_mv,
             v_bat_mv,
             percent,
             calibrated: self.calibrated,
+            source,
         })
     }
 
@@ -130,6 +148,23 @@ pub fn read_battery_once(bat_gpio: i32) -> Result<BatteryStatus> {
 fn battery_percent(vbat_v: f32) -> u8 {
     let pct = ((vbat_v - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V)) * 100.0;
     pct.round().clamp(0.0, 100.0) as u8
+}
+
+fn detect_power_source(v_bat_mv: i32, usb_serial_jtag_connected: bool) -> PowerSource {
+    if usb_serial_jtag_connected {
+        return PowerSource::Usb;
+    }
+    if v_bat_mv >= USB_SUPPLY_MIN_MV {
+        return PowerSource::Usb;
+    }
+    if (BATTERY_PLAUSIBLE_MIN_MV..=BATTERY_PLAUSIBLE_MAX_MV).contains(&v_bat_mv) {
+        return PowerSource::Battery;
+    }
+    PowerSource::Unknown
+}
+
+fn usb_serial_jtag_connected() -> bool {
+    unsafe { usb_serial_jtag_is_connected() }
 }
 
 fn esp_ok(code: sys::esp_err_t) -> Result<()> {
