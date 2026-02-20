@@ -48,6 +48,28 @@ fn esp_ok_ctx_allow(code: sys::esp_err_t, ctx: &str, allow: &[sys::esp_err_t]) -
     }
 }
 
+fn wifi_force_sta_ready() -> Result<()> {
+    // Bring driver into a clean STA state before scan/connect.
+    let _ = unsafe { sys::esp_wifi_scan_stop() };
+    let _ = unsafe { sys::esp_wifi_disconnect() };
+    let _ = esp_ok_ctx_allow(
+        unsafe { sys::esp_wifi_stop() },
+        "esp_wifi_stop",
+        &[sys::ESP_ERR_WIFI_NOT_STARTED],
+    );
+    esp_ok_ctx(
+        unsafe { sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA) },
+        "esp_wifi_set_mode(STA)",
+    )?;
+    esp_ok_ctx_allow(
+        unsafe { sys::esp_wifi_start() },
+        "esp_wifi_start",
+        &[sys::ESP_ERR_WIFI_CONN],
+    )?;
+    let _ = unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) };
+    Ok(())
+}
+
 pub fn wifi_init_once() -> Result<()> {
     static mut INIT: bool = false;
     unsafe {
@@ -66,6 +88,7 @@ pub fn wifi_init_once() -> Result<()> {
         "esp_event_loop_create_default",
         &[sys::ESP_ERR_INVALID_STATE],
     )?;
+
     let sta = unsafe { sys::esp_netif_create_default_wifi_sta() };
     if sta.is_null() {
         return Err(anyhow!("esp_netif_create_default_wifi_sta failed"));
@@ -77,6 +100,15 @@ pub fn wifi_init_once() -> Result<()> {
         "esp_wifi_init",
         &[sys::ESP_ERR_INVALID_STATE],
     )?;
+    // Reset persisted WiFi config that may have been left by previous firmware.
+    let _ = unsafe { sys::esp_wifi_restore() };
+    // Force common 2.4GHz legacy protocol set (ESP32-S3 compatible).
+    let _ = unsafe {
+        sys::esp_wifi_set_protocol(
+            sys::wifi_interface_t_WIFI_IF_STA,
+            (sys::WIFI_PROTOCOL_11B | sys::WIFI_PROTOCOL_11G | sys::WIFI_PROTOCOL_11N) as u8,
+        )
+    };
     esp_ok_ctx(
         unsafe { sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA) },
         "esp_wifi_set_mode",
@@ -120,9 +152,7 @@ fn wifi_auth_name(auth: sys::wifi_auth_mode_t) -> &'static str {
 pub fn wifi_scan_records() -> Result<Vec<WifiAp>> {
     wifi_init_once()?;
     let _ = wifi_monitor_stop();
-    let _ = unsafe { sys::esp_wifi_disconnect() };
-    let _ = unsafe { sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA) };
-    let _ = unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) };
+    wifi_force_sta_ready()?;
 
     let mut count: u16 = 0;
     for attempt in 0..3 {
@@ -204,8 +234,9 @@ fn copy_cstr_bytes(dst: &mut [u8], src: &[u8], field: &str) -> Result<()> {
 pub fn wifi_connect(ssid: &str, password: &str) -> Result<()> {
     wifi_init_once()?;
     let _ = wifi_monitor_stop();
+    wifi_force_sta_ready()?;
     println!(
-        "[WIFI] default connect ssid='{}' pass_len={}",
+        "[WIFI_CALL] wifi_connect ssid='{}' pass_len={}",
         ssid,
         password.len()
     );
@@ -218,13 +249,15 @@ pub fn wifi_connect(ssid: &str, password: &str) -> Result<()> {
         sta.scan_method = sys::wifi_scan_method_t_WIFI_ALL_CHANNEL_SCAN;
         sta.sort_method = sys::wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL;
         sta.threshold.rssi = -127;
-        // OPEN only if no password is provided; otherwise allow legacy+modern protected APs.
+        // Use broad auth threshold for protected networks.
         sta.threshold.authmode = if password.is_empty() {
             sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
         } else {
-            sys::wifi_auth_mode_t_WIFI_AUTH_WEP
+            sys::wifi_auth_mode_t_WIFI_AUTH_WPA_PSK
         };
-        sta.pmf_cfg.capable = true;
+        sta.channel = 0;
+        sta.bssid_set = false;
+        sta.pmf_cfg.capable = false;
         sta.pmf_cfg.required = false;
     }
 
@@ -239,6 +272,7 @@ pub fn wifi_connect(ssid: &str, password: &str) -> Result<()> {
 pub fn wifi_connect_ap(ap: &WifiAp, password: &str) -> Result<()> {
     wifi_init_once()?;
     let _ = wifi_monitor_stop();
+    wifi_force_sta_ready()?;
 
     let mut cfg = sys::wifi_config_t::default();
     unsafe {
@@ -251,17 +285,17 @@ pub fn wifi_connect_ap(ap: &WifiAp, password: &str) -> Result<()> {
         sta.threshold.authmode = if password.is_empty() {
             sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
         } else {
-            sys::wifi_auth_mode_t_WIFI_AUTH_WEP
+            sys::wifi_auth_mode_t_WIFI_AUTH_WPA_PSK
         };
         sta.channel = ap.channel;
         sta.bssid = ap.bssid;
         sta.bssid_set = true;
-        sta.pmf_cfg.capable = true;
+        sta.pmf_cfg.capable = false;
         sta.pmf_cfg.required = false;
     }
 
     println!(
-        "[WIFI] connect ssid='{}' ch={} auth={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} pass_len={}",
+        "[WIFI_CALL] wifi_connect_ap ssid='{}' ch={} auth={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} pass_len={}",
         ap.ssid,
         ap.channel,
         wifi_auth_name(ap.authmode),
@@ -420,13 +454,10 @@ pub fn wifi_monitor_start(channel: u8) -> Result<()> {
 
 pub fn wifi_monitor_stop() -> Result<()> {
     unsafe {
-        if PROMISC_ACTIVE {
-            esp_ok_ctx(
-                sys::esp_wifi_set_promiscuous(false),
-                "esp_wifi_set_promiscuous(false)",
-            )?;
-            PROMISC_ACTIVE = false;
-        }
+        // Force-disable promiscuous mode even if our local state flag drifted.
+        let _ = sys::esp_wifi_set_promiscuous(false);
+        sys::esp_wifi_set_promiscuous_rx_cb(None);
+        PROMISC_ACTIVE = false;
     }
     Ok(())
 }

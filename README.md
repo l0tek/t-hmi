@@ -48,12 +48,20 @@ cargo run
   - Result screen stays visible until Back button is pressed.
 - `HTTP SD`
   - Mini HTTP server submenu to expose SD card content over WiFi.
-  - Start/Stop from UI (`/sd` endpoint).
+  - Start/Stop from UI (`http://<IP>:8080/sd`).
+  - Requires active STA WiFi connection with valid IPv4.
 - `WiFi Login`
   - Scan/select AP, password input on device, connect from UI.
   - `Default` button connects using credentials from `wifi_secrets.local`.
+  - Connection strategy prefers direct SSID connect (`wifi_connect`) and falls back to AP-pinned connect (`wifi_connect_ap`) if needed.
   - After successful connect, a dedicated `WiFi Verbunden` screen shows:
   - SSID, channel, RSSI, IPv4 address.
+
+## HTTP SD Usage
+1. Connect WiFi first (IP must not be `0.0.0.0`).
+2. Open `Device -> Mini HTTP`.
+3. Tap `Start HTTP SD`.
+4. Open `http://<ESP_IP>:8080/sd` from a client in the same network.
 
 ## WiFi Default Credentials
 Default credentials are injected at build time from `wifi_secrets.local`

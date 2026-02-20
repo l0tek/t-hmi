@@ -1398,36 +1398,12 @@ fn main() -> Result<()> {
                     }
                 } else if hit_http_menu && !was_pressed {
                     screen = Screen::HttpMenu;
-                    draw_http_menu(panel)?;
-                    draw_text_box(
+                    let ip_hint = wifi::wifi_sta_ipv4().ok().filter(|ip| ip != "0.0.0.0");
+                    draw_http_menu(
                         panel,
-                        0,
-                        130,
-                        LCD_H_RES,
-                        24,
-                        "Tippen: Start/Stop",
-                        Rgb565::WHITE,
-                        Rgb565::BLACK,
-                    )?;
-                    draw_text_box(
-                        panel,
-                        0,
-                        156,
-                        LCD_H_RES,
-                        24,
-                        &format!("Status: {}", http_status),
-                        Rgb565::WHITE,
-                        Rgb565::BLACK,
-                    )?;
-                    draw_text_box(
-                        panel,
-                        0,
-                        186,
-                        LCD_H_RES,
-                        24,
-                        "Pfad: /sd",
-                        Rgb565::WHITE,
-                        Rgb565::BLACK,
+                        http_server.is_some(),
+                        &http_status,
+                        ip_hint.as_deref(),
                     )?;
                 } else if hit_wifi_login && !was_pressed {
                     screen = Screen::WifiLogin;
@@ -1584,14 +1560,31 @@ fn main() -> Result<()> {
                     draw_device_menu(panel)?;
                 } else if hit_sd_view && !was_pressed {
                     if http_server.is_none() {
-                        match http_server::MiniHttpServer::start(8080) {
-                            Ok(server) => {
-                                let port = server.port();
-                                http_server = Some(server);
-                                http_status = format!("AN (Port {})", port);
+                        match wifi::wifi_sta_ipv4() {
+                            Ok(ip) if ip != "0.0.0.0" => {
+                                match http_server::MiniHttpServer::start(8080) {
+                                    Ok(server) => {
+                                        let port = server.port();
+                                        http_server = Some(server);
+                                        http_status = format!("AN {}:{}", ip, port);
+                                        println!(
+                                            "[HTTP] server started at http://{}:{}/sd",
+                                            ip, port
+                                        );
+                                    }
+                                    Err(err) => {
+                                        http_status = format!("Fehler: {}", err);
+                                        println!("[HTTP] start failed: {}", err);
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                http_status = String::from("Kein IPv4 auf STA");
+                                println!("[HTTP] start blocked: no IPv4 on STA");
                             }
                             Err(err) => {
-                                http_status = format!("Fehler: {}", err);
+                                http_status = format!("IP Fehler: {}", err);
+                                println!("[HTTP] IP check failed: {}", err);
                             }
                         }
                     } else if let Some(mut server) = http_server.take() {
@@ -1599,36 +1592,12 @@ fn main() -> Result<()> {
                         http_status = String::from("Aus");
                     }
 
-                    draw_http_menu(panel)?;
-                    draw_text_box(
+                    let ip_hint = wifi::wifi_sta_ipv4().ok().filter(|ip| ip != "0.0.0.0");
+                    draw_http_menu(
                         panel,
-                        0,
-                        130,
-                        LCD_H_RES,
-                        24,
-                        "Tippen: Start/Stop",
-                        Rgb565::WHITE,
-                        Rgb565::BLACK,
-                    )?;
-                    draw_text_box(
-                        panel,
-                        0,
-                        156,
-                        LCD_H_RES,
-                        24,
-                        &format!("Status: {}", http_status),
-                        Rgb565::WHITE,
-                        Rgb565::BLACK,
-                    )?;
-                    draw_text_box(
-                        panel,
-                        0,
-                        186,
-                        LCD_H_RES,
-                        24,
-                        "Browser: http://<IP>:8080/sd",
-                        Rgb565::WHITE,
-                        Rgb565::BLACK,
+                        http_server.is_some(),
+                        &http_status,
+                        ip_hint.as_deref(),
                     )?;
                 }
                 was_pressed = hit_back || hit_sd_view;
@@ -1881,28 +1850,56 @@ fn main() -> Result<()> {
                         .and_then(|items| items.into_iter().find(|ap| ap.ssid == default_ssid));
                     if let Some(ap) = default_ap.as_ref() {
                         println!(
-                            "[WIFI] default AP gefunden ssid='{}' ch={} auth={:?}",
+                            "[WIFI_PATH] default: scan-hit -> wifi_connect_ap (ssid='{}', ch={}, auth={:?})",
                             ap.ssid, ap.channel, ap.authmode
                         );
                     } else {
                         println!(
-                            "[WIFI] default AP '{}' nicht im Scan gefunden, nutze direkten Connect",
+                            "[WIFI_PATH] default: scan-miss -> wifi_connect (ssid='{}')",
                             default_ssid
                         );
                     }
 
-                    let connect_result = if let Some(ap) = default_ap.as_ref() {
-                        wifi::wifi_connect_ap(ap, default_password)
-                    } else {
-                        wifi::wifi_connect(default_ssid, default_password)
-                    };
+                    let connect_result = wifi::wifi_connect(default_ssid, default_password);
 
                     match connect_result {
                         Ok(()) => match wifi::wifi_wait_connected(12_000) {
                             Ok(info) => connected_info = Some(info),
                             Err(err) => {
-                                connect_error = format!("default wait: {}", err);
                                 println!("[WIFI] default wait failed: {}", err);
+                                if let Some(ap) = default_ap.as_ref() {
+                                    println!(
+                                        "[WIFI_PATH] default: wait timeout -> fallback wifi_connect_ap (ssid='{}', ch={})",
+                                        ap.ssid, ap.channel
+                                    );
+                                    match wifi::wifi_connect_ap(ap, default_password) {
+                                        Ok(()) => match wifi::wifi_wait_connected(12_000) {
+                                            Ok(info) => connected_info = Some(info),
+                                            Err(fallback_err) => {
+                                                connect_error = format!(
+                                                    "default wait connect_ap fallback: {}",
+                                                    fallback_err
+                                                );
+                                                println!(
+                                                    "[WIFI] default fallback connect_ap wait failed: {}",
+                                                    fallback_err
+                                                );
+                                            }
+                                        },
+                                        Err(fallback_err) => {
+                                            connect_error = format!(
+                                                "default connect_ap fallback: {}",
+                                                fallback_err
+                                            );
+                                            println!(
+                                                "[WIFI] default fallback connect_ap failed: {}",
+                                                fallback_err
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    connect_error = format!("default wait: {}", err);
+                                }
                             }
                         },
                         Err(err) => {
@@ -2005,39 +2002,50 @@ fn main() -> Result<()> {
                         let mut connect_error = String::new();
 
                         let mut connected_info: Option<wifi::WifiConnectionInfo> = None;
-                        match wifi::wifi_connect_ap(ap, password) {
+                        println!(
+                            "[WIFI_PATH] manual: selected AP -> wifi_connect (ssid='{}')",
+                            ap.ssid
+                        );
+                        match wifi::wifi_connect(&ap.ssid, password) {
                             Ok(()) => match wifi::wifi_wait_connected(10_000) {
                                 Ok(info) => connected_info = Some(info),
                                 Err(err) => {
-                                    connect_error = format!("connect_ap wait: {}", err);
-                                    println!("[WIFI] connect_ap wait failed: {}", err);
+                                    connect_error = format!("connect wait: {}", err);
+                                    println!("[WIFI] connect wait failed: {}", err);
                                 }
                             },
                             Err(err) => {
-                                connect_error = format!("connect_ap: {}", err);
-                                println!("[WIFI] connect_ap failed: {}", err);
+                                connect_error = format!("connect: {}", err);
+                                println!("[WIFI] connect failed: {}", err);
                             }
                         }
 
                         if connected_info.is_none() {
-                            println!("[WIFI] fallback connect ssid='{}'", ap.ssid);
-                            match wifi::wifi_connect(&ap.ssid, password) {
+                            println!(
+                                "[WIFI_PATH] manual: connect not connected -> fallback wifi_connect_ap (ssid='{}', ch={})",
+                                ap.ssid, ap.channel
+                            );
+                            match wifi::wifi_connect_ap(ap, password) {
                                 Ok(()) => match wifi::wifi_wait_connected(10_000) {
                                     Ok(info) => connected_info = Some(info),
                                     Err(err) => {
                                         if !connect_error.is_empty() {
                                             connect_error.push_str(" | ");
                                         }
-                                        connect_error.push_str(&format!("fallback wait: {}", err));
-                                        println!("[WIFI] fallback wait failed: {}", err);
+                                        connect_error.push_str(&format!(
+                                            "fallback connect_ap wait: {}",
+                                            err
+                                        ));
+                                        println!("[WIFI] fallback connect_ap wait failed: {}", err);
                                     }
                                 },
                                 Err(err) => {
                                     if !connect_error.is_empty() {
                                         connect_error.push_str(" | ");
                                     }
-                                    connect_error.push_str(&format!("fallback: {}", err));
-                                    println!("[WIFI] fallback connect failed: {}", err);
+                                    connect_error
+                                        .push_str(&format!("fallback connect_ap: {}", err));
+                                    println!("[WIFI] fallback connect_ap failed: {}", err);
                                 }
                             }
                         }

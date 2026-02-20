@@ -17,26 +17,35 @@ pub struct MiniHttpServer {
 impl MiniHttpServer {
     pub fn start(port: u16) -> Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
+        if let Ok(addr) = listener.local_addr() {
+            println!("[HTTP] listening on {}", addr);
+        }
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
 
-        let join = thread::spawn(move || {
-            while !stop_thread.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        let _ = handle_client(stream);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(30));
-                    }
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(100));
+        let join = thread::Builder::new()
+            .name("mini-http".to_string())
+            // ESP pthread default stack is often too small for std::net + formatting.
+            .stack_size(16 * 1024)
+            .spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _addr)) => {
+                            println!("[HTTP] client connected");
+                            let _ = handle_client(stream);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(30));
+                        }
+                        Err(_) => {
+                            println!("[HTTP] accept error");
+                            thread::sleep(Duration::from_millis(100));
+                        }
                     }
                 }
-            }
-        });
+            })?;
 
         Ok(Self {
             stop,
@@ -72,6 +81,7 @@ fn handle_client(mut stream: TcpStream) -> Result<()> {
 
     let request = String::from_utf8_lossy(&req[..n]);
     let path = parse_path(&request);
+    println!("[HTTP] request path={}", path);
 
     match path {
         "/" => {

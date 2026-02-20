@@ -524,14 +524,74 @@ pub fn draw_device_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
     Ok(())
 }
 
-pub fn draw_http_menu(panel: sys::esp_lcd_panel_handle_t) -> Result<()> {
+pub fn draw_http_menu(
+    panel: sys::esp_lcd_panel_handle_t,
+    running: bool,
+    status: &str,
+    ip: Option<&str>,
+) -> Result<()> {
     clear_screen(panel, Rgb565::BLACK)?;
     draw_header(panel, "Mini HTTP", true)?;
+    let button_text = if running {
+        "  Stop HTTP SD"
+    } else {
+        "  Start HTTP SD"
+    };
+    let button_fg = if running {
+        Rgb565::new(63, 16, 0)
+    } else {
+        Rgb565::new(0, 63, 0)
+    };
     draw_menu_line(
         panel,
         HTTP_MENU_BTN1_Y,
-        "  SD Karte anschauen",
-        Rgb565::new(0, 63, 0),
+        button_text,
+        button_fg,
+        Rgb565::BLACK,
+    )?;
+    draw_text_box(
+        panel,
+        0,
+        130,
+        LCD_H_RES,
+        24,
+        "Tippen: Start/Stop",
+        Rgb565::WHITE,
+        Rgb565::BLACK,
+    )?;
+    let status_fg = if status.starts_with("Fehler")
+        || status.starts_with("IP Fehler")
+        || status.starts_with("Kein IPv4")
+    {
+        Rgb565::new(63, 0, 0)
+    } else if running {
+        Rgb565::new(0, 63, 0)
+    } else {
+        Rgb565::WHITE
+    };
+    draw_text_box(
+        panel,
+        0,
+        156,
+        LCD_H_RES,
+        24,
+        &format!("Status: {}", status),
+        status_fg,
+        Rgb565::BLACK,
+    )?;
+    let url_line = if let Some(ip) = ip {
+        format!("URL: http://{}:8080/sd", ip)
+    } else {
+        "URL: WLAN/IPv4 fehlt".to_string()
+    };
+    draw_text_box(
+        panel,
+        0,
+        186,
+        LCD_H_RES,
+        24,
+        &url_line,
+        Rgb565::WHITE,
         Rgb565::BLACK,
     )?;
     Ok(())
