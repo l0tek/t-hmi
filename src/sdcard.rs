@@ -1,6 +1,12 @@
 use anyhow::{anyhow, Result};
 use esp_idf_sys as sys;
-use std::{ffi::CString, fs, ptr};
+use std::{
+    ffi::CString,
+    fs,
+    io::Write,
+    ptr,
+    sync::{Mutex, OnceLock},
+};
 
 const SD_CLK_GPIO: i32 = 12;
 const SD_CMD_GPIO: i32 = 11;
@@ -17,6 +23,21 @@ pub struct SdEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+}
+
+pub struct SdCardSession {
+    card_addr: usize,
+}
+
+#[derive(Default)]
+struct SharedMountState {
+    refs: u32,
+    card_addr: usize,
+}
+
+fn shared_mount_state() -> &'static Mutex<SharedMountState> {
+    static STATE: OnceLock<Mutex<SharedMountState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(SharedMountState::default()))
 }
 
 fn sdmmc_host_default() -> sys::sdmmc_host_t {
@@ -92,66 +113,118 @@ fn mount_sd(base_path: &CString) -> Result<*mut sys::sdmmc_card_t> {
     Ok(card)
 }
 
-pub fn list_sd_root() -> Result<Vec<SdEntry>> {
-    let base_path = CString::new(SD_BASE_PATH)?;
-    let card = mount_sd(&base_path)?;
+impl SdCardSession {
+    pub fn mount() -> Result<Self> {
+        let mut guard = shared_mount_state()
+            .lock()
+            .map_err(|_| anyhow!("sd mount mutex poisoned"))?;
 
-    let list_result = (|| -> Result<Vec<SdEntry>> {
-        let mut out: Vec<SdEntry> = Vec::new();
-        for entry in fs::read_dir(SD_BASE_PATH)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
-            out.push(SdEntry {
-                name: entry.file_name().to_string_lossy().to_string(),
-                is_dir: meta.is_dir(),
-                size: meta.len(),
-            });
+        if guard.refs == 0 {
+            let base_path = CString::new(SD_BASE_PATH)?;
+            let card = mount_sd(&base_path)?;
+            guard.card_addr = card as usize;
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
-    })();
-
-    let unmount_result =
-        crate::esp_ok(unsafe { sys::esp_vfs_fat_sdcard_unmount(base_path.as_ptr(), card) });
-    if let Err(err) = list_result {
-        let _ = unmount_result;
-        return Err(err);
+        guard.refs = guard.refs.saturating_add(1);
+        Ok(Self {
+            card_addr: guard.card_addr,
+        })
     }
-    unmount_result?;
-    list_result
+
+    pub fn append_line(&self, file_name: &str, line: &str) -> Result<()> {
+        if file_name.is_empty() || file_name.contains('/') || file_name.contains('\\') {
+            return Err(anyhow!("ungueltiger Dateiname"));
+        }
+        let path = format!("{}/{}", SD_BASE_PATH, file_name);
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(line.as_bytes())?;
+        f.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+impl Drop for SdCardSession {
+    fn drop(&mut self) {
+        let Ok(mut guard) = shared_mount_state().lock() else {
+            return;
+        };
+        if guard.refs == 0 {
+            return;
+        }
+        guard.refs -= 1;
+        if guard.refs == 0 && guard.card_addr != 0 {
+            if let Ok(base_path) = CString::new(SD_BASE_PATH) {
+                let _ = crate::esp_ok(unsafe {
+                    sys::esp_vfs_fat_sdcard_unmount(
+                        base_path.as_ptr(),
+                        guard.card_addr as *mut sys::sdmmc_card_t,
+                    )
+                });
+            }
+            guard.card_addr = 0;
+        }
+    }
+}
+
+pub fn list_sd_root() -> Result<Vec<SdEntry>> {
+    let _session = SdCardSession::mount()?;
+    let mut out: Vec<SdEntry> = Vec::new();
+    for entry in fs::read_dir(SD_BASE_PATH)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        out.push(SdEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            is_dir: meta.is_dir(),
+            size: meta.len(),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+pub fn read_sd_file(file_name: &str) -> Result<Vec<u8>> {
+    if file_name.is_empty() || file_name.contains('/') || file_name.contains('\\') {
+        return Err(anyhow!("ungueltiger Dateiname"));
+    }
+
+    let _session = SdCardSession::mount()?;
+    Ok(fs::read(format!("{}/{}", SD_BASE_PATH, file_name))?)
 }
 
 pub fn run_sdcard_format_test<F>(mut progress: F) -> Result<()>
 where
     F: FnMut(u8, &str) -> Result<()>,
 {
-    let base_path = CString::new(SD_BASE_PATH)?;
-
     progress(5, "Initialisiere...")?;
-    let card = mount_sd(&base_path)?;
+    let session = SdCardSession::mount()?;
     progress(25, "SD erkannt")?;
 
-    let test_result = (|| -> Result<()> {
-        progress(40, "Formatiere...")?;
-        crate::esp_ok(unsafe { sys::esp_vfs_fat_sdcard_format(base_path.as_ptr(), card) })?;
-        progress(75, "Schreibe test.txt...")?;
-        fs::write("/sdcard/test.txt", "OK")?;
-        progress(90, "Lese test.txt...")?;
-        let content = fs::read_to_string("/sdcard/test.txt")?;
-        if content.trim() == "OK" {
-            Ok(())
-        } else {
-            Err(anyhow!("test.txt Inhalt ungueltig: {}", content.trim()))
+    {
+        let guard = shared_mount_state()
+            .lock()
+            .map_err(|_| anyhow!("sd mount mutex poisoned"))?;
+        if guard.refs > 1 {
+            return Err(anyhow!("SD busy: andere SD-Session aktiv"));
         }
-    })();
-
-    let unmount_result =
-        crate::esp_ok(unsafe { sys::esp_vfs_fat_sdcard_unmount(base_path.as_ptr(), card) });
-    if let Err(err) = test_result {
-        let _ = unmount_result;
-        return Err(err);
     }
-    unmount_result?;
+
+    let base_path = CString::new(SD_BASE_PATH)?;
+    progress(40, "Formatiere...")?;
+    crate::esp_ok(unsafe {
+        sys::esp_vfs_fat_sdcard_format(
+            base_path.as_ptr(),
+            session.card_addr as *mut sys::sdmmc_card_t,
+        )
+    })?;
+    progress(75, "Schreibe test.txt...")?;
+    fs::write("/sdcard/test.txt", "OK")?;
+    progress(90, "Lese test.txt...")?;
+    let content = fs::read_to_string("/sdcard/test.txt")?;
+    if content.trim() != "OK" {
+        return Err(anyhow!("test.txt Inhalt ungueltig: {}", content.trim()));
+    }
     progress(100, "Fertig")?;
     Ok(())
 }

@@ -10,11 +10,18 @@ use esp_idf_hal::{
     peripherals::Peripherals,
 };
 use esp_idf_sys as sys;
-use std::{convert::Infallible, ffi::CString, ptr};
+use std::{
+    convert::Infallible,
+    ffi::c_char,
+    ffi::CString,
+    ptr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub mod device;
 pub mod gps;
 pub mod http_server;
+pub mod remote;
 pub mod sdcard;
 pub mod ui;
 pub mod wifi;
@@ -24,8 +31,8 @@ use ui::{
     clear_screen, draw_battery_status_frame, draw_battery_status_values, draw_battery_unavailable,
     draw_bitmap, draw_device_menu, draw_header, draw_http_menu, draw_menu, draw_text_box,
     draw_text_box_small, draw_wifi_channel_monitor, draw_wifi_frame, draw_wifi_menu,
-    draw_wifi_message, draw_wifi_monitor, draw_wifi_screen, BatteryLabels, PacketSample,
-    RssiSeries, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, DEVICE_MENU_BTN1_Y,
+    draw_wifi_message, draw_wifi_monitor, draw_wifi_screen, set_header_status_icons, BatteryLabels,
+    PacketSample, RssiSeries, BACK_BTN_H, BACK_BTN_W, BACK_BTN_X, BACK_BTN_Y, DEVICE_MENU_BTN1_Y,
     DEVICE_MENU_BTN2_Y, DEVICE_MENU_BTN3_Y, DEVICE_MENU_BTN4_Y, DEVICE_MENU_BTN5_Y,
     DEVICE_MENU_BTN6_Y, HTTP_MENU_BTN1_Y, MENU_BTN1_Y, MENU_BTN2_Y, MENU_BTN_H, MENU_BTN_W,
     MENU_BTN_X, WIFI_CH_BTN_H, WIFI_CH_BTN_LEFT_X, WIFI_CH_BTN_RIGHT_X, WIFI_CH_BTN_W,
@@ -53,13 +60,148 @@ const PWR_ON_GPIO: i32 = 14;
 const BL_GPIO: i32 = 38;
 // External/reed switch input; Arduino example treats it as active-high.
 const POWER_BTN_GPIO: i32 = 21;
-const POWER_BTN_DEBOUNCE_MS: u32 = 40;
-fn wifi_default_ssid() -> &'static str {
-    option_env!("WIFI_DEFAULT_SSID").unwrap_or("")
+
+#[derive(Clone, Debug)]
+struct DefaultWifiCred {
+    ssid: String,
+    password: String,
 }
 
-fn wifi_default_password() -> &'static str {
-    option_env!("WIFI_DEFAULT_PASSWORD").unwrap_or("")
+fn push_default_cred(
+    out: &mut Vec<DefaultWifiCred>,
+    ssid: Option<&'static str>,
+    password: Option<&'static str>,
+) {
+    let ssid = ssid.unwrap_or("").trim();
+    if ssid.is_empty() {
+        return;
+    }
+    let password = password.unwrap_or("").trim();
+    if out.iter().any(|e| e.ssid == ssid && e.password == password) {
+        return;
+    }
+    out.push(DefaultWifiCred {
+        ssid: ssid.to_string(),
+        password: password.to_string(),
+    });
+}
+
+fn wifi_default_networks() -> Vec<DefaultWifiCred> {
+    let mut out = Vec::new();
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID_1"),
+        option_env!("WIFI_DEFAULT_PASSWORD_1"),
+    );
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID_2"),
+        option_env!("WIFI_DEFAULT_PASSWORD_2"),
+    );
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID_3"),
+        option_env!("WIFI_DEFAULT_PASSWORD_3"),
+    );
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID_4"),
+        option_env!("WIFI_DEFAULT_PASSWORD_4"),
+    );
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID_5"),
+        option_env!("WIFI_DEFAULT_PASSWORD_5"),
+    );
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID_6"),
+        option_env!("WIFI_DEFAULT_PASSWORD_6"),
+    );
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID_7"),
+        option_env!("WIFI_DEFAULT_PASSWORD_7"),
+    );
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID_8"),
+        option_env!("WIFI_DEFAULT_PASSWORD_8"),
+    );
+
+    // Backward compatibility with old single-entry config.
+    push_default_cred(
+        &mut out,
+        option_env!("WIFI_DEFAULT_SSID"),
+        option_env!("WIFI_DEFAULT_PASSWORD"),
+    );
+
+    out
+}
+
+fn connect_with_fallback(
+    ssid: &str,
+    password: &str,
+    wait_ms: u32,
+) -> Result<wifi::WifiConnectionInfo> {
+    let scanned_ap = wifi::wifi_scan_records()
+        .ok()
+        .and_then(|items| items.into_iter().find(|ap| ap.ssid == ssid));
+
+    if let Some(ap) = scanned_ap.as_ref() {
+        println!(
+            "[WIFI_PATH] scan-hit -> wifi_connect_ap possible (ssid='{}', ch={})",
+            ap.ssid, ap.channel
+        );
+    } else {
+        println!(
+            "[WIFI_PATH] scan-miss -> wifi_connect only (ssid='{}')",
+            ssid
+        );
+    }
+
+    match wifi::wifi_connect(ssid, password) {
+        Ok(()) => match wifi::wifi_wait_connected(wait_ms) {
+            Ok(info) => return Ok(info),
+            Err(err) => println!("[WIFI] wait after wifi_connect failed: {}", err),
+        },
+        Err(err) => println!("[WIFI] wifi_connect failed: {}", err),
+    }
+
+    let ap = scanned_ap.ok_or_else(|| anyhow!("kein AP scan-hit fuer {}", ssid))?;
+    wifi::wifi_connect_ap(&ap, password)?;
+    wifi::wifi_wait_connected(wait_ms)
+}
+
+fn connect_default_sequence(
+    defaults: &[DefaultWifiCred],
+) -> Result<(wifi::WifiConnectionInfo, usize)> {
+    let mut errors: Vec<String> = Vec::new();
+    for (idx, item) in defaults.iter().enumerate() {
+        println!(
+            "[WIFI_BOOT] versuche default {}: '{}' (pass_len={})",
+            idx + 1,
+            item.ssid,
+            item.password.len()
+        );
+        match connect_with_fallback(&item.ssid, &item.password, 12_000) {
+            Ok(info) => return Ok((info, idx)),
+            Err(err) => {
+                println!(
+                    "[WIFI_BOOT] default {} fehlgeschlagen (ssid='{}'): {}",
+                    idx + 1,
+                    item.ssid,
+                    err
+                );
+                errors.push(format!("{}: {}", item.ssid, err));
+            }
+        }
+    }
+    Err(anyhow!(
+        "kein Default-WLAN verbunden ({} Versuche): {}",
+        defaults.len(),
+        errors.join(" | ")
+    ))
 }
 
 fn enter_deep_sleep() -> ! {
@@ -69,10 +211,7 @@ fn enter_deep_sleep() -> ! {
         sys::gpio_hold_en(BL_GPIO);
         sys::gpio_deep_sleep_hold_en();
         sys::esp_sleep_enable_ext0_wakeup(POWER_BTN_GPIO, 1);
-    }
-    unsafe { sys::esp_deep_sleep_start() };
-    loop {
-        FreeRtos::delay_ms(1000);
+        sys::esp_deep_sleep_start()
     }
 }
 
@@ -566,6 +705,7 @@ const CHANNEL_MIN: u8 = 1;
 const CHANNEL_MAX: u8 = 13;
 const CHANNEL_SAMPLE_MAX: usize = 60;
 const CHANNEL_SAMPLE_INTERVAL_MS: u32 = 500;
+const GPS_LOG_INTERVAL_MS: u32 = 200;
 const WIFI_LOGIN_LINE_Y: i32 = 52;
 const WIFI_LOGIN_LINE_H: i32 = 18;
 const WIFI_LOGIN_MAX_ITEMS: usize = 4;
@@ -912,6 +1052,227 @@ fn draw_wifi_connected_screen(
     Ok(())
 }
 
+struct GpsSdLogger {
+    session: Option<sdcard::SdCardSession>,
+    file_name: Option<String>,
+    last_log_ms: u32,
+}
+
+impl GpsSdLogger {
+    fn new() -> Self {
+        Self {
+            session: None,
+            file_name: None,
+            last_log_ms: 0,
+        }
+    }
+
+    fn current_unix_secs_system() -> Option<u64> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    }
+
+    fn is_plausible_unix(unix_secs: u64) -> bool {
+        // 2023-01-01T00:00:00Z to reject boot-default epoch.
+        unix_secs >= 1_672_531_200
+    }
+
+    fn resolve_unix_secs(gps: &gps::GpsReader<'_>) -> u64 {
+        if let Some(secs) = Self::current_unix_secs_system().filter(|v| Self::is_plausible_unix(*v))
+        {
+            return secs;
+        }
+        if let Some(secs) = gps.current_utc_unix_secs() {
+            return secs;
+        }
+        Self::current_unix_secs_system().unwrap_or(0)
+    }
+
+    fn make_file_name(unix_secs: u64) -> String {
+        let (year, month, day, hour, minute, second) = unix_to_utc_ymdhms(unix_secs);
+        format!("gpslog_{year:04}{month:02}{day:02}_{hour:02}{minute:02}{second:02}.txt")
+    }
+
+    fn make_file_name_83(unix_secs: u64) -> String {
+        // 8.3 fallback for FAT configurations without long file names.
+        // Name is DDHHMMSS + ".txt" (8 chars base + 3 chars ext).
+        let (_year, _month, day, hour, minute, second) = unix_to_utc_ymdhms(unix_secs);
+        format!("{day:02}{hour:02}{minute:02}{second:02}.txt")
+    }
+
+    fn start(&mut self, now_ms: u32, gps: &gps::GpsReader<'_>) -> Result<()> {
+        self.stop();
+        let session = sdcard::SdCardSession::mount()?;
+        let unix_secs = Self::resolve_unix_secs(gps);
+        let long_file_name = Self::make_file_name(unix_secs);
+        let short_file_name = Self::make_file_name_83(unix_secs);
+        let file_name = match session.append_line(
+            &long_file_name,
+            "ts_ms;fix;sats;lat;lon;baud;raw_bps;last_nmea",
+        ) {
+            Ok(()) => long_file_name,
+            Err(err) => {
+                println!(
+                    "[GPS_LOG] long filename failed ({}), fallback to /sdcard/{}",
+                    err, short_file_name
+                );
+                session.append_line(
+                    &short_file_name,
+                    "ts_ms;fix;sats;lat;lon;baud;raw_bps;last_nmea",
+                )?;
+                short_file_name
+            }
+        };
+        println!("[GPS_LOG] start file=/sdcard/{}", file_name);
+        self.session = Some(session);
+        self.file_name = Some(file_name);
+        self.last_log_ms = now_ms.wrapping_sub(GPS_LOG_INTERVAL_MS);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        if let Some(file_name) = self.file_name.as_deref() {
+            println!("[GPS_LOG] close file=/sdcard/{}", file_name);
+        }
+        self.session = None;
+        self.file_name = None;
+        self.last_log_ms = 0;
+    }
+
+    fn poll_log(&mut self, now_ms: u32, gps: &gps::GpsReader<'_>) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let Some(file_name) = self.file_name.as_deref() else {
+            return;
+        };
+        if now_ms.wrapping_sub(self.last_log_ms) < GPS_LOG_INTERVAL_MS {
+            return;
+        }
+        self.last_log_ms = now_ms;
+        let sats = gps
+            .sats()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let lat = gps
+            .lat()
+            .map(|v| format!("{:.6}", v))
+            .unwrap_or_else(|| "-".to_string());
+        let lon = gps
+            .lon()
+            .map(|v| format!("{:.6}", v))
+            .unwrap_or_else(|| "-".to_string());
+        let last_nmea = gps
+            .last_sentence()
+            .replace(';', ",")
+            .replace('\r', " ")
+            .replace('\n', " ");
+        let line = format!(
+            "{};{};{};{};{};{};{};{}",
+            now_ms,
+            if gps.fix() { "1" } else { "0" },
+            sats,
+            lat,
+            lon,
+            gps.current_baud(),
+            gps.raw_bytes_per_sec(),
+            last_nmea
+        );
+        if let Err(err) = session.append_line(file_name, &line) {
+            println!("[GPS_LOG] write failed: {}", err);
+            self.stop();
+        }
+    }
+}
+
+fn ntp_sync_time(timeout_ms: u32) -> Result<bool> {
+    let server = b"pool.ntp.org\0";
+    let mut cfg = sys::esp_sntp_config_t::default();
+    cfg.smooth_sync = false;
+    cfg.server_from_dhcp = false;
+    cfg.wait_for_sync = true;
+    cfg.start = true;
+    cfg.sync_cb = None;
+    cfg.renew_servers_after_new_IP = false;
+    cfg.ip_event_to_renew = sys::ip_event_t_IP_EVENT_STA_GOT_IP;
+    cfg.index_of_first_server = 0;
+    cfg.num_of_servers = 1;
+    cfg.servers[0] = server.as_ptr() as *const c_char;
+
+    unsafe {
+        // Reinit to ensure clean state when reconnecting.
+        sys::esp_netif_sntp_deinit();
+    }
+    esp_ok(unsafe { sys::esp_netif_sntp_init(&cfg) })?;
+    let wait_res = unsafe { sys::esp_netif_sntp_sync_wait(timeout_ms as _) };
+    unsafe { sys::esp_netif_sntp_deinit() };
+
+    if wait_res == sys::ESP_OK {
+        let secs = GpsSdLogger::current_unix_secs_system().unwrap_or(0);
+        println!("[TIME] NTP sync ok unix={}", secs);
+        return Ok(true);
+    }
+    println!("[TIME] NTP sync failed code={}", wait_res);
+    Ok(false)
+}
+
+fn unix_to_utc_ymdhms(unix_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let day_secs = 86_400u64;
+    let days = (unix_secs / day_secs) as i64;
+    let sec_of_day = (unix_secs % day_secs) as u32;
+    let hour = sec_of_day / 3_600;
+    let minute = (sec_of_day % 3_600) / 60;
+    let second = sec_of_day % 60;
+    let (year, month, day) = civil_from_days(days);
+    (year, month, day, hour, minute, second)
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
+    // Howard Hinnant's civil-from-days algorithm; epoch is 1970-01-01.
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as u32, d as u32)
+}
+
+fn draw_boot_screen(panel: sys::esp_lcd_panel_handle_t, lines: &[String]) -> Result<()> {
+    clear_screen(panel, Rgb565::BLACK)?;
+    draw_header(panel, "Boot", false)?;
+    let max_lines = 16usize;
+    let start = lines.len().saturating_sub(max_lines);
+    for (row, line) in lines[start..].iter().enumerate() {
+        draw_text_box_small(
+            panel,
+            0,
+            36 + (row as i32 * 14),
+            LCD_H_RES,
+            12,
+            &truncate_chars(line, 38),
+            Rgb565::WHITE,
+            Rgb565::BLACK,
+        )?;
+    }
+    Ok(())
+}
+
+fn push_boot_log(
+    panel: sys::esp_lcd_panel_handle_t,
+    logs: &mut Vec<String>,
+    line: impl Into<String>,
+) -> Result<()> {
+    logs.push(line.into());
+    draw_boot_screen(panel, logs)
+}
+
 fn main() -> Result<()> {
     sys::link_patches();
 
@@ -928,18 +1289,24 @@ fn main() -> Result<()> {
     power_btn.set_pull(Pull::Down)?;
 
     // Read battery before LCD init since BAT_ADC shares IO03 with LCD_MOSI.
-    let mut battery_cache = if BAT_ADC_GPIO >= 0 {
+    let battery_cache = if BAT_ADC_GPIO >= 0 {
         read_battery_once(BAT_ADC_GPIO).ok()
     } else {
         None
     };
 
     let panel = init_lcd()?;
+    set_header_status_icons(false, false);
+    let mut boot_logs: Vec<String> = Vec::new();
+    push_boot_log(panel, &mut boot_logs, "Display initialisiert")?;
 
-    draw_menu(panel)?;
-
+    push_boot_log(panel, &mut boot_logs, "Init NVS...")?;
     nvs_init()?;
+    push_boot_log(panel, &mut boot_logs, "NVS OK")?;
+    push_boot_log(panel, &mut boot_logs, "Init Touch...")?;
     let mut touch = Xpt2046::new()?;
+    push_boot_log(panel, &mut boot_logs, "Touch OK")?;
+    push_boot_log(panel, &mut boot_logs, "Lade Kalibrierung...")?;
     let points = match calibration_load()? {
         Some(points) => points,
         None => {
@@ -968,9 +1335,22 @@ fn main() -> Result<()> {
             points
         }
     };
+    push_boot_log(panel, &mut boot_logs, "Kalibrierung bereit")?;
     let calibration = Calibration::from_points(&points);
     let mut touch = Some(touch);
+    push_boot_log(panel, &mut boot_logs, "Init GPS...")?;
     let mut gps_reader = gps::GpsReader::new(p.uart1, p.pins.gpio16, p.pins.gpio15)?;
+    let mut gps_sd_logger = GpsSdLogger::new();
+    push_boot_log(panel, &mut boot_logs, "GPS OK")?;
+    let default_wifi = wifi_default_networks();
+    let default_primary_ssid = default_wifi
+        .first()
+        .map(|x| x.ssid.clone())
+        .unwrap_or_default();
+    let default_primary_password = default_wifi
+        .first()
+        .map(|x| x.password.clone())
+        .unwrap_or_default();
 
     let mut was_pressed = false;
     let mut screen = Screen::Menu;
@@ -988,21 +1368,414 @@ fn main() -> Result<()> {
     let mut gps_last_redraw: u32 = 0;
     let mut gps_back_to_device = false;
     let mut loopback_last_redraw: u32 = 0;
-    let mut sd_result_ok = false;
-    let mut sd_result_msg = String::new();
     let mut http_server: Option<http_server::MiniHttpServer> = None;
     let mut http_status = String::from("Aus");
     let mut wifi_login_items: Vec<wifi::WifiAp> = Vec::new();
     let mut wifi_login_selected: Option<usize> = None;
     let mut wifi_login_offset: usize = 0;
     let mut wifi_login_status = String::from("Scan und Netz waehlen");
-    let mut wifi_login_password = wifi_default_password().to_string();
+    let mut wifi_login_password = default_primary_password.clone();
     let mut wifi_login_char_idx: usize = 0;
-    let mut wifi_connected_ssid = String::new();
-    let mut wifi_connected_rssi: i8 = 0;
-    let mut wifi_connected_channel: u8 = 0;
-    let mut wifi_connected_ip = String::new();
+    if !default_wifi.is_empty() {
+        push_boot_log(
+            panel,
+            &mut boot_logs,
+            format!("Auto WLAN: {} Netze", default_wifi.len()),
+        )?;
+        match connect_default_sequence(&default_wifi) {
+            Ok((_info, used_idx)) => {
+                push_boot_log(
+                    panel,
+                    &mut boot_logs,
+                    format!("WLAN verbunden: {}", default_wifi[used_idx].ssid),
+                )?;
+                let wifi_connected_ip =
+                    wifi::wifi_wait_ipv4(10_000).unwrap_or_else(|_| "-".to_string());
+                set_header_status_icons(true, false);
+
+                if wifi_connected_ip != "-" {
+                    let _ = ntp_sync_time(10_000);
+                    push_boot_log(
+                        panel,
+                        &mut boot_logs,
+                        format!("IPv4: {}", wifi_connected_ip),
+                    )?;
+                    match http_server::MiniHttpServer::start(8080) {
+                        Ok(server) => {
+                            let port = server.port();
+                            http_server = Some(server);
+                            http_status = format!("AN {}:{}", wifi_connected_ip, port);
+                            println!(
+                                "[HTTP] auto-started at http://{}:{}/sd (default #{})",
+                                wifi_connected_ip,
+                                port,
+                                used_idx + 1
+                            );
+                            set_header_status_icons(true, true);
+                            push_boot_log(panel, &mut boot_logs, "HTTPD gestartet")?;
+                        }
+                        Err(err) => {
+                            http_status = format!("AutoStart Fehler: {}", err);
+                            println!("[HTTP] auto-start failed: {}", err);
+                            set_header_status_icons(true, false);
+                            push_boot_log(panel, &mut boot_logs, format!("HTTPD Fehler: {}", err))?;
+                        }
+                    }
+                } else {
+                    http_status = String::from("Kein IPv4 auf STA");
+                    push_boot_log(panel, &mut boot_logs, "IPv4 fehlt")?;
+                }
+            }
+            Err(err) => {
+                println!("[WIFI_BOOT] auto default connect failed: {}", err);
+                http_status = String::from("Aus");
+                set_header_status_icons(false, false);
+                push_boot_log(panel, &mut boot_logs, format!("WLAN Fehler: {}", err))?;
+            }
+        }
+    } else {
+        push_boot_log(panel, &mut boot_logs, "Kein Default WLAN konfiguriert")?;
+    }
+    push_boot_log(panel, &mut boot_logs, "Start Menu...")?;
+    draw_menu(panel)?;
+
     loop {
+        for cmd in remote::drain() {
+            match cmd {
+                remote::RemoteCommand::GotoMenu => {
+                    screen = Screen::Menu;
+                    draw_menu(panel)?;
+                    remote::set_status("ok: menu");
+                }
+                remote::RemoteCommand::GotoWifiMenu => {
+                    screen = Screen::WifiMenu;
+                    draw_wifi_menu(panel)?;
+                    remote::set_status("ok: wifi_menu");
+                }
+                remote::RemoteCommand::GotoDeviceMenu => {
+                    screen = Screen::DeviceMenu;
+                    draw_device_menu(panel)?;
+                    remote::set_status("ok: device_menu");
+                }
+                remote::RemoteCommand::GotoGps => {
+                    screen = Screen::Gps;
+                    gps_back_to_device = true;
+                    gps_last_redraw = tick_ms;
+                    gps_reader.set_host_log_enabled(true);
+                    if let Err(err) = gps_sd_logger.start(tick_ms, &gps_reader) {
+                        remote::set_status(format!("error: gps log start: {}", err));
+                    } else {
+                        gps::draw_gps_frame(panel)?;
+                        gps::draw_gps_values(panel, &gps_reader)?;
+                        remote::set_status("ok: gps");
+                    }
+                }
+                remote::RemoteCommand::GotoBattery => {
+                    screen = Screen::BatteryStatus;
+                    battery_last_read = 0;
+                    battery_ignore_back_until = tick_ms.wrapping_add(1200);
+                    battery_ignore_back = true;
+                    battery_labels = Some(draw_battery_status_frame(panel)?);
+                    remote::set_status("ok: battery");
+                }
+                remote::RemoteCommand::GotoLoopback => {
+                    screen = Screen::UartLoopback;
+                    gps_reader.set_host_log_enabled(false);
+                    gps_reader.loopback_reset();
+                    loopback_last_redraw = tick_ms;
+                    gps::draw_uart_loopback_frame(panel)?;
+                    gps::draw_uart_loopback_values(panel, &gps_reader)?;
+                    remote::set_status("ok: loopback");
+                }
+                remote::RemoteCommand::GotoHttpMenu => {
+                    screen = Screen::HttpMenu;
+                    let ip_hint = wifi::wifi_sta_ipv4().ok().filter(|ip| ip != "0.0.0.0");
+                    draw_http_menu(
+                        panel,
+                        http_server.is_some(),
+                        &http_status,
+                        ip_hint.as_deref(),
+                    )?;
+                    remote::set_status("ok: http_menu");
+                }
+                remote::RemoteCommand::GotoWifiLogin => {
+                    screen = Screen::WifiLogin;
+                    match wifi::wifi_scan_records() {
+                        Ok(items) => {
+                            wifi_login_items = items;
+                            wifi_login_selected = wifi_login_items
+                                .iter()
+                                .position(|ap| {
+                                    !default_primary_ssid.is_empty()
+                                        && ap.ssid == default_primary_ssid
+                                })
+                                .or_else(|| {
+                                    if wifi_login_items.is_empty() {
+                                        None
+                                    } else {
+                                        Some(0)
+                                    }
+                                });
+                            wifi_login_offset = wifi_login_selected
+                                .map(|idx| (idx / WIFI_LOGIN_MAX_ITEMS) * WIFI_LOGIN_MAX_ITEMS)
+                                .unwrap_or(0);
+                            wifi_login_status = if wifi_login_items.is_empty() {
+                                String::from("Keine Netze gefunden")
+                            } else if let Some(idx) = wifi_login_selected {
+                                format!("Ausgewaehlt: {}", wifi_login_items[idx].ssid)
+                            } else {
+                                String::from("Netz waehlen, dann Connect")
+                            };
+                        }
+                        Err(err) => {
+                            wifi_login_items.clear();
+                            wifi_login_selected = None;
+                            wifi_login_offset = 0;
+                            wifi_login_status = format!("Scan Fehler: {}", err);
+                        }
+                    }
+                    draw_wifi_login_screen(
+                        panel,
+                        &wifi_login_items,
+                        wifi_login_selected,
+                        wifi_login_offset,
+                        &wifi_login_status,
+                        &wifi_login_password,
+                        wifi_login_char_idx,
+                    )?;
+                    remote::set_status("ok: wifi_login");
+                }
+                remote::RemoteCommand::RunSdFormat => {
+                    screen = Screen::SdCardFormat;
+                    clear_screen(panel, Rgb565::BLACK)?;
+                    draw_header(panel, "SD Format", true)?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        100,
+                        LCD_H_RES,
+                        30,
+                        "Formatiere SD...",
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                    draw_text_box(
+                        panel,
+                        0,
+                        140,
+                        LCD_H_RES,
+                        40,
+                        "0%",
+                        Rgb565::WHITE,
+                        Rgb565::BLACK,
+                    )?;
+                    let (sd_result_ok, sd_result_msg) =
+                        match sdcard::run_sdcard_format_test(|percent, msg| {
+                            draw_text_box(
+                                panel,
+                                0,
+                                100,
+                                LCD_H_RES,
+                                30,
+                                msg,
+                                Rgb565::WHITE,
+                                Rgb565::BLACK,
+                            )?;
+                            let pct = format!("{percent}%");
+                            draw_text_box(
+                                panel,
+                                0,
+                                140,
+                                LCD_H_RES,
+                                40,
+                                &pct,
+                                Rgb565::WHITE,
+                                Rgb565::BLACK,
+                            )?;
+                            Ok(())
+                        }) {
+                            Ok(()) => (true, String::from("OK")),
+                            Err(err) => (false, format!("{}", err)),
+                        };
+                    clear_screen(panel, Rgb565::BLACK)?;
+                    draw_header(panel, "SD Format", true)?;
+                    if sd_result_ok {
+                        draw_text_box(
+                            panel,
+                            0,
+                            100,
+                            LCD_H_RES,
+                            30,
+                            "test.txt gelesen:",
+                            Rgb565::new(0, 63, 0),
+                            Rgb565::BLACK,
+                        )?;
+                        draw_text_box(
+                            panel,
+                            0,
+                            140,
+                            LCD_H_RES,
+                            40,
+                            "OK",
+                            Rgb565::new(0, 63, 0),
+                            Rgb565::BLACK,
+                        )?;
+                        remote::set_status("ok: sd_format");
+                    } else {
+                        draw_text_box(
+                            panel,
+                            0,
+                            100,
+                            LCD_H_RES,
+                            30,
+                            "SD Fehler",
+                            Rgb565::new(63, 0, 0),
+                            Rgb565::BLACK,
+                        )?;
+                        draw_text_box(
+                            panel,
+                            0,
+                            140,
+                            LCD_H_RES,
+                            40,
+                            &sd_result_msg,
+                            Rgb565::new(63, 0, 0),
+                            Rgb565::BLACK,
+                        )?;
+                        remote::set_status(format!("error: sd_format: {}", sd_result_msg));
+                    }
+                }
+                remote::RemoteCommand::ToggleHttp => {
+                    if http_server.is_none() {
+                        match wifi::wifi_sta_ipv4() {
+                            Ok(ip) if ip != "0.0.0.0" => {
+                                match http_server::MiniHttpServer::start(8080) {
+                                    Ok(server) => {
+                                        let port = server.port();
+                                        http_server = Some(server);
+                                        http_status = format!("AN {}:{}", ip, port);
+                                        set_header_status_icons(true, true);
+                                        remote::set_status("ok: http start");
+                                    }
+                                    Err(err) => {
+                                        http_status = format!("Fehler: {}", err);
+                                        set_header_status_icons(true, false);
+                                        remote::set_status(format!("error: http start: {}", err));
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                http_status = String::from("Kein IPv4 auf STA");
+                                set_header_status_icons(false, http_server.is_some());
+                                remote::set_status("error: no ipv4");
+                            }
+                            Err(err) => {
+                                http_status = format!("IP Fehler: {}", err);
+                                set_header_status_icons(false, http_server.is_some());
+                                remote::set_status(format!("error: ip check: {}", err));
+                            }
+                        }
+                    } else if let Some(mut server) = http_server.take() {
+                        server.stop();
+                        http_status = String::from("Aus");
+                        let wifi_on = wifi::wifi_sta_ipv4()
+                            .ok()
+                            .map(|ip| ip != "0.0.0.0")
+                            .unwrap_or(false);
+                        set_header_status_icons(wifi_on, false);
+                        remote::set_status("ok: http stop");
+                    }
+                }
+                remote::RemoteCommand::WifiScan => match wifi::wifi_scan() {
+                    Ok(items) => {
+                        screen = Screen::WifiList;
+                        draw_wifi_screen(panel, &items)?;
+                        remote::set_status(format!("ok: wifi_scan {} ap", items.len()));
+                    }
+                    Err(err) => remote::set_status(format!("error: wifi_scan: {}", err)),
+                },
+                remote::RemoteCommand::WifiMonitor => {
+                    screen = Screen::WifiMonitor;
+                    monitor_series.clear();
+                    monitor_last_scan = 0;
+                    draw_wifi_monitor(panel, &[], RSSI_MIN, RSSI_MAX)?;
+                    remote::set_status("ok: wifi_monitor");
+                }
+                remote::RemoteCommand::WifiChannelMonitor => {
+                    screen = Screen::WifiChannelMonitor;
+                    channel_monitor_channel = strongest_channel().unwrap_or(CHANNEL_MIN);
+                    channel_monitor_samples.clear();
+                    channel_monitor_last_sample = 0;
+                    let _ = wifi::wifi_monitor_start(channel_monitor_channel);
+                    let _ = wifi::wifi_monitor_take_counts();
+                    draw_wifi_channel_monitor(
+                        panel,
+                        channel_monitor_channel,
+                        &channel_monitor_samples,
+                    )?;
+                    remote::set_status(format!(
+                        "ok: wifi_channel_monitor ch{}",
+                        channel_monitor_channel
+                    ));
+                }
+                remote::RemoteCommand::WifiMonitorStop => {
+                    let _ = wifi::wifi_monitor_stop();
+                    screen = Screen::WifiMenu;
+                    draw_wifi_menu(panel)?;
+                    remote::set_status("ok: wifi_monitor_stop");
+                }
+                remote::RemoteCommand::WifiConnectDefault => {
+                    match connect_default_sequence(&default_wifi) {
+                        Ok((info, used_idx)) => {
+                            let ssid = if info.ssid.is_empty() {
+                                default_wifi[used_idx].ssid.clone()
+                            } else {
+                                info.ssid
+                            };
+                            let ip =
+                                wifi::wifi_wait_ipv4(8_000).unwrap_or_else(|_| "-".to_string());
+                            if ip != "-" {
+                                let _ = ntp_sync_time(10_000);
+                            }
+                            set_header_status_icons(true, http_server.is_some());
+                            screen = Screen::WifiConnected;
+                            draw_wifi_connected_screen(panel, &ssid, info.rssi, info.channel, &ip)?;
+                            remote::set_status(format!("ok: wifi_default {} {}", ssid, ip));
+                        }
+                        Err(err) => remote::set_status(format!("error: wifi_default: {}", err)),
+                    }
+                }
+                remote::RemoteCommand::WifiConnect { ssid, password } => {
+                    match connect_with_fallback(&ssid, &password, 12_000) {
+                        Ok(info) => {
+                            let shown_ssid = if info.ssid.is_empty() {
+                                ssid
+                            } else {
+                                info.ssid
+                            };
+                            let ip =
+                                wifi::wifi_wait_ipv4(8_000).unwrap_or_else(|_| "-".to_string());
+                            if ip != "-" {
+                                let _ = ntp_sync_time(10_000);
+                            }
+                            set_header_status_icons(true, http_server.is_some());
+                            screen = Screen::WifiConnected;
+                            draw_wifi_connected_screen(
+                                panel,
+                                &shown_ssid,
+                                info.rssi,
+                                info.channel,
+                                &ip,
+                            )?;
+                            remote::set_status(format!("ok: wifi_connect {} {}", shown_ssid, ip));
+                        }
+                        Err(err) => remote::set_status(format!("error: wifi_connect: {}", err)),
+                    }
+                }
+            }
+            was_pressed = false;
+        }
+
         let power_btn_raw = power_btn.is_high();
         if power_btn_raw && !power_btn_last_raw {
             bl.set_low()?;
@@ -1049,6 +1822,9 @@ fn main() -> Result<()> {
                     gps_back_to_device = false;
                     gps_last_redraw = tick_ms;
                     gps_reader.set_host_log_enabled(false);
+                    if let Err(err) = gps_sd_logger.start(tick_ms, &gps_reader) {
+                        println!("[GPS_LOG] start failed: {}", err);
+                    }
                     gps::draw_gps_frame(panel)?;
                     gps::draw_gps_values(panel, &gps_reader)?;
                 } else if hit_device && !was_pressed {
@@ -1285,6 +2061,9 @@ fn main() -> Result<()> {
                     gps_back_to_device = true;
                     gps_last_redraw = tick_ms;
                     gps_reader.set_host_log_enabled(true);
+                    if let Err(err) = gps_sd_logger.start(tick_ms, &gps_reader) {
+                        println!("[GPS_LOG] start failed: {}", err);
+                    }
                     gps::draw_gps_frame(panel)?;
                     gps::draw_gps_values(panel, &gps_reader)?;
                 } else if hit_loopback && !was_pressed {
@@ -1318,39 +2097,34 @@ fn main() -> Result<()> {
                         Rgb565::WHITE,
                         Rgb565::BLACK,
                     )?;
-                    match sdcard::run_sdcard_format_test(|percent, msg| {
-                        draw_text_box(
-                            panel,
-                            0,
-                            100,
-                            LCD_H_RES,
-                            30,
-                            msg,
-                            Rgb565::WHITE,
-                            Rgb565::BLACK,
-                        )?;
-                        let pct = format!("{percent}%");
-                        draw_text_box(
-                            panel,
-                            0,
-                            140,
-                            LCD_H_RES,
-                            40,
-                            &pct,
-                            Rgb565::WHITE,
-                            Rgb565::BLACK,
-                        )?;
-                        Ok(())
-                    }) {
-                        Ok(()) => {
-                            sd_result_ok = true;
-                            sd_result_msg = String::from("OK");
-                        }
-                        Err(err) => {
-                            sd_result_ok = false;
-                            sd_result_msg = format!("{}", err);
-                        }
-                    }
+                    let (sd_result_ok, sd_result_msg) =
+                        match sdcard::run_sdcard_format_test(|percent, msg| {
+                            draw_text_box(
+                                panel,
+                                0,
+                                100,
+                                LCD_H_RES,
+                                30,
+                                msg,
+                                Rgb565::WHITE,
+                                Rgb565::BLACK,
+                            )?;
+                            let pct = format!("{percent}%");
+                            draw_text_box(
+                                panel,
+                                0,
+                                140,
+                                LCD_H_RES,
+                                40,
+                                &pct,
+                                Rgb565::WHITE,
+                                Rgb565::BLACK,
+                            )?;
+                            Ok(())
+                        }) {
+                            Ok(()) => (true, String::from("OK")),
+                            Err(err) => (false, format!("{}", err)),
+                        };
                     clear_screen(panel, Rgb565::BLACK)?;
                     draw_header(panel, "SD Format", true)?;
                     if sd_result_ok {
@@ -1407,15 +2181,14 @@ fn main() -> Result<()> {
                     )?;
                 } else if hit_wifi_login && !was_pressed {
                     screen = Screen::WifiLogin;
-                    wifi_login_status = String::from("Scanne...");
                     match wifi::wifi_scan_records() {
                         Ok(items) => {
                             wifi_login_items = items;
                             wifi_login_selected = wifi_login_items
                                 .iter()
                                 .position(|ap| {
-                                    !wifi_default_ssid().is_empty()
-                                        && ap.ssid == wifi_default_ssid()
+                                    !default_primary_ssid.is_empty()
+                                        && ap.ssid == default_primary_ssid
                                 })
                                 .or_else(|| {
                                     if wifi_login_items.is_empty() {
@@ -1469,6 +2242,7 @@ fn main() -> Result<()> {
                     && y < BACK_BTN_Y + BACK_BTN_H;
                 if hit_back && !was_pressed {
                     gps_reader.set_host_log_enabled(false);
+                    gps_sd_logger.stop();
                     if gps_back_to_device {
                         screen = Screen::DeviceMenu;
                         draw_device_menu(panel)?;
@@ -1478,6 +2252,7 @@ fn main() -> Result<()> {
                     }
                 } else {
                     let gps_changed = gps_reader.poll(tick_ms)?;
+                    gps_sd_logger.poll_log(tick_ms, &gps_reader);
                     if gps_changed || tick_ms.wrapping_sub(gps_last_redraw) >= 300 {
                         gps::draw_gps_values(panel, &gps_reader)?;
                         gps_last_redraw = tick_ms;
@@ -1567,6 +2342,7 @@ fn main() -> Result<()> {
                                         let port = server.port();
                                         http_server = Some(server);
                                         http_status = format!("AN {}:{}", ip, port);
+                                        set_header_status_icons(true, true);
                                         println!(
                                             "[HTTP] server started at http://{}:{}/sd",
                                             ip, port
@@ -1574,22 +2350,30 @@ fn main() -> Result<()> {
                                     }
                                     Err(err) => {
                                         http_status = format!("Fehler: {}", err);
+                                        set_header_status_icons(true, false);
                                         println!("[HTTP] start failed: {}", err);
                                     }
                                 }
                             }
                             Ok(_) => {
                                 http_status = String::from("Kein IPv4 auf STA");
+                                set_header_status_icons(false, http_server.is_some());
                                 println!("[HTTP] start blocked: no IPv4 on STA");
                             }
                             Err(err) => {
                                 http_status = format!("IP Fehler: {}", err);
+                                set_header_status_icons(false, http_server.is_some());
                                 println!("[HTTP] IP check failed: {}", err);
                             }
                         }
                     } else if let Some(mut server) = http_server.take() {
                         server.stop();
                         http_status = String::from("Aus");
+                        let wifi_on = wifi::wifi_sta_ipv4()
+                            .ok()
+                            .map(|ip| ip != "0.0.0.0")
+                            .unwrap_or(false);
+                        set_header_status_icons(wifi_on, false);
                     }
 
                     let ip_hint = wifi::wifi_sta_ipv4().ok().filter(|ip| ip != "0.0.0.0");
@@ -1687,8 +2471,8 @@ fn main() -> Result<()> {
                             wifi_login_selected = wifi_login_items
                                 .iter()
                                 .position(|ap| {
-                                    !wifi_default_ssid().is_empty()
-                                        && ap.ssid == wifi_default_ssid()
+                                    !default_primary_ssid.is_empty()
+                                        && ap.ssid == default_primary_ssid
                                 })
                                 .or_else(|| {
                                     if wifi_login_items.is_empty() {
@@ -1816,10 +2600,8 @@ fn main() -> Result<()> {
                         wifi_login_char_idx,
                     )?;
                 } else if hit_default && !was_pressed {
-                    let default_ssid = wifi_default_ssid();
-                    let default_password = wifi_default_password();
-                    if default_ssid.is_empty() {
-                        wifi_login_status = String::from("Default SSID fehlt (wifi_secrets.local)");
+                    if default_wifi.is_empty() {
+                        wifi_login_status = String::from("Kein Default WLAN (wifi_secrets.local)");
                         draw_wifi_login_screen(
                             panel,
                             &wifi_login_items,
@@ -1832,7 +2614,7 @@ fn main() -> Result<()> {
                         was_pressed = true;
                         continue;
                     }
-                    wifi_login_status = format!("Default connect {}...", default_ssid);
+                    wifi_login_status = format!("Default connect: {} Netze...", default_wifi.len());
                     draw_wifi_login_screen(
                         panel,
                         &wifi_login_items,
@@ -1843,95 +2625,35 @@ fn main() -> Result<()> {
                         wifi_login_char_idx,
                     )?;
 
-                    let mut connected_info: Option<wifi::WifiConnectionInfo> = None;
-                    let mut connect_error = String::new();
-                    let default_ap = wifi::wifi_scan_records()
-                        .ok()
-                        .and_then(|items| items.into_iter().find(|ap| ap.ssid == default_ssid));
-                    if let Some(ap) = default_ap.as_ref() {
-                        println!(
-                            "[WIFI_PATH] default: scan-hit -> wifi_connect_ap (ssid='{}', ch={}, auth={:?})",
-                            ap.ssid, ap.channel, ap.authmode
-                        );
-                    } else {
-                        println!(
-                            "[WIFI_PATH] default: scan-miss -> wifi_connect (ssid='{}')",
-                            default_ssid
-                        );
-                    }
-
-                    let connect_result = wifi::wifi_connect(default_ssid, default_password);
-
-                    match connect_result {
-                        Ok(()) => match wifi::wifi_wait_connected(12_000) {
-                            Ok(info) => connected_info = Some(info),
-                            Err(err) => {
-                                println!("[WIFI] default wait failed: {}", err);
-                                if let Some(ap) = default_ap.as_ref() {
-                                    println!(
-                                        "[WIFI_PATH] default: wait timeout -> fallback wifi_connect_ap (ssid='{}', ch={})",
-                                        ap.ssid, ap.channel
-                                    );
-                                    match wifi::wifi_connect_ap(ap, default_password) {
-                                        Ok(()) => match wifi::wifi_wait_connected(12_000) {
-                                            Ok(info) => connected_info = Some(info),
-                                            Err(fallback_err) => {
-                                                connect_error = format!(
-                                                    "default wait connect_ap fallback: {}",
-                                                    fallback_err
-                                                );
-                                                println!(
-                                                    "[WIFI] default fallback connect_ap wait failed: {}",
-                                                    fallback_err
-                                                );
-                                            }
-                                        },
-                                        Err(fallback_err) => {
-                                            connect_error = format!(
-                                                "default connect_ap fallback: {}",
-                                                fallback_err
-                                            );
-                                            println!(
-                                                "[WIFI] default fallback connect_ap failed: {}",
-                                                fallback_err
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    connect_error = format!("default wait: {}", err);
-                                }
+                    match connect_default_sequence(&default_wifi) {
+                        Ok((info, used_idx)) => {
+                            let wifi_connected_ssid = if info.ssid.is_empty() {
+                                default_wifi[used_idx].ssid.clone()
+                            } else {
+                                info.ssid.clone()
+                            };
+                            let wifi_connected_rssi = info.rssi;
+                            let wifi_connected_channel = info.channel;
+                            let wifi_connected_ip =
+                                wifi::wifi_wait_ipv4(8_000).unwrap_or_else(|_| "-".to_string());
+                            if wifi_connected_ip != "-" {
+                                let _ = ntp_sync_time(10_000);
                             }
-                        },
-                        Err(err) => {
-                            connect_error = format!("default connect: {}", err);
-                            println!("[WIFI] default connect failed: {}", err);
+                            set_header_status_icons(true, http_server.is_some());
+                            screen = Screen::WifiConnected;
+                            draw_wifi_connected_screen(
+                                panel,
+                                &wifi_connected_ssid,
+                                wifi_connected_rssi,
+                                wifi_connected_channel,
+                                &wifi_connected_ip,
+                            )?;
+                            was_pressed = true;
+                            continue;
                         }
-                    }
-
-                    if let Some(info) = connected_info {
-                        wifi_connected_ssid = if info.ssid.is_empty() {
-                            default_ssid.to_string()
-                        } else {
-                            info.ssid.clone()
-                        };
-                        wifi_connected_rssi = info.rssi;
-                        wifi_connected_channel = info.channel;
-                        wifi_connected_ip =
-                            wifi::wifi_wait_ipv4(8_000).unwrap_or_else(|_| "-".to_string());
-                        screen = Screen::WifiConnected;
-                        draw_wifi_connected_screen(
-                            panel,
-                            &wifi_connected_ssid,
-                            wifi_connected_rssi,
-                            wifi_connected_channel,
-                            &wifi_connected_ip,
-                        )?;
-                        was_pressed = true;
-                        continue;
-                    } else if connect_error.is_empty() {
-                        wifi_login_status = String::from("Default Connect fehlgeschlagen");
-                    } else {
-                        wifi_login_status = format!("Default Fehler: {}", connect_error);
+                        Err(err) => {
+                            wifi_login_status = format!("Default Fehler: {}", err);
+                        }
                     }
                     draw_wifi_login_screen(
                         panel,
@@ -1945,15 +2667,13 @@ fn main() -> Result<()> {
                 } else if hit_connect && !was_pressed {
                     if let Some(idx) = wifi_login_selected {
                         let ap = &wifi_login_items[idx];
-                        let default_ssid = wifi_default_ssid();
-                        let default_password = wifi_default_password();
-                        if !default_ssid.is_empty()
-                            && ap.ssid != default_ssid
-                            && !default_password.is_empty()
-                            && wifi_login_password == default_password
-                        {
+                        if let Some(conflict) = default_wifi.iter().find(|d| {
+                            !d.password.is_empty()
+                                && ap.ssid != d.ssid
+                                && wifi_login_password == d.password
+                        }) {
                             wifi_login_status =
-                                format!("Achtung: Default-PWD ist fuer {}", default_ssid);
+                                format!("Achtung: Default-PWD ist fuer {}", conflict.ssid);
                             draw_wifi_login_screen(
                                 panel,
                                 &wifi_login_items,
@@ -2051,15 +2771,19 @@ fn main() -> Result<()> {
                         }
 
                         if let Some(info) = connected_info {
-                            wifi_connected_ssid = if info.ssid.is_empty() {
+                            let wifi_connected_ssid = if info.ssid.is_empty() {
                                 selected_ssid
                             } else {
                                 info.ssid.clone()
                             };
-                            wifi_connected_rssi = info.rssi;
-                            wifi_connected_channel = info.channel;
-                            wifi_connected_ip =
+                            let wifi_connected_rssi = info.rssi;
+                            let wifi_connected_channel = info.channel;
+                            let wifi_connected_ip =
                                 wifi::wifi_wait_ipv4(8_000).unwrap_or_else(|_| "-".to_string());
+                            if wifi_connected_ip != "-" {
+                                let _ = ntp_sync_time(10_000);
+                            }
+                            set_header_status_icons(true, http_server.is_some());
                             screen = Screen::WifiConnected;
                             draw_wifi_connected_screen(
                                 panel,

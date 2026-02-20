@@ -56,6 +56,7 @@ pub struct GpsReader<'d> {
     lb_last_send_ms: u32,
     lb_last_rx: Option<u8>,
     raw_recent: Vec<u8>,
+    last_utc_unix_secs: Option<u64>,
 }
 
 impl<'d> GpsReader<'d> {
@@ -102,6 +103,7 @@ impl<'d> GpsReader<'d> {
             lb_last_send_ms: 0,
             lb_last_rx: None,
             raw_recent: Vec::with_capacity(RAW_RECENT_MAX),
+            last_utc_unix_secs: None,
         })
     }
 
@@ -203,31 +205,76 @@ impl<'d> GpsReader<'d> {
             return false;
         }
 
-        self.has_valid_nmea = true;
-        self.last_sentence.clear();
-        self.last_sentence.push_str(sentence);
+        let Some((sentence_wo_checksum, checksum_ok)) = split_nmea_checksum(sentence) else {
+            return false;
+        };
+        if !checksum_ok {
+            return false;
+        }
 
-        let sentence_wo_checksum = sentence.split('*').next().unwrap_or(sentence);
         let parts: Vec<&str> = sentence_wo_checksum.split(',').collect();
         if parts.is_empty() {
             return false;
         }
 
+        self.has_valid_nmea = true;
+        self.last_sentence.clear();
+        self.last_sentence.push_str(sentence);
+
         match parts[0] {
             "$GPRMC" | "$GNRMC" => {
                 if let Some(status) = parts.get(2) {
-                    self.fix = *status == "A";
+                    if *status == "A" {
+                        self.fix = true;
+                    } else if *status == "V" {
+                        self.fix = false;
+                    }
                 }
-                self.lat = parse_lat_lon(parts.get(3), parts.get(4), 2);
-                self.lon = parse_lat_lon(parts.get(5), parts.get(6), 3);
+                if let Some(lat) = parse_lat_lon(parts.get(3), parts.get(4), 2) {
+                    self.lat = Some(lat);
+                }
+                if let Some(lon) = parse_lat_lon(parts.get(5), parts.get(6), 3) {
+                    self.lon = Some(lon);
+                }
+                if let Some(unix) = parse_rmc_utc_unix(&parts) {
+                    self.last_utc_unix_secs = Some(unix);
+                }
             }
             "$GPGGA" | "$GNGGA" => {
                 if let Some(fix_quality) = parts.get(6) {
-                    self.fix = fix_quality.parse::<u8>().ok().unwrap_or(0) > 0;
+                    if let Ok(q) = fix_quality.parse::<u8>() {
+                        self.fix = q > 0;
+                    }
                 }
-                self.sats = parts.get(7).and_then(|v| v.parse::<u8>().ok());
-                self.lat = parse_lat_lon(parts.get(2), parts.get(3), 2);
-                self.lon = parse_lat_lon(parts.get(4), parts.get(5), 3);
+                if let Some(sats) = parts.get(7).and_then(|v| v.parse::<u8>().ok()) {
+                    self.sats = Some(sats);
+                }
+                if let Some(lat) = parse_lat_lon(parts.get(2), parts.get(3), 2) {
+                    self.lat = Some(lat);
+                }
+                if let Some(lon) = parse_lat_lon(parts.get(4), parts.get(5), 3) {
+                    self.lon = Some(lon);
+                }
+            }
+            "$GPGLL" | "$GNGLL" => {
+                if let Some(lat) = parse_lat_lon(parts.get(1), parts.get(2), 2) {
+                    self.lat = Some(lat);
+                }
+                if let Some(lon) = parse_lat_lon(parts.get(3), parts.get(4), 3) {
+                    self.lon = Some(lon);
+                }
+                if let Some(status) = parts.get(6) {
+                    if *status == "A" {
+                        self.fix = true;
+                    } else if *status == "V" {
+                        self.fix = false;
+                    }
+                }
+            }
+            "$GPZDA" | "$GNZDA" => {
+                if let Some(unix) = parse_zda_utc_unix(&parts) {
+                    self.last_utc_unix_secs = Some(unix);
+                }
             }
             _ => {}
         }
@@ -365,6 +412,10 @@ impl<'d> GpsReader<'d> {
             .collect()
     }
 
+    pub fn current_utc_unix_secs(&self) -> Option<u64> {
+        self.last_utc_unix_secs
+    }
+
     pub fn loopback_reset(&mut self) {
         self.lb_tx_ok = 0;
         self.lb_rx_ok = 0;
@@ -437,6 +488,9 @@ fn next_pattern_byte(v: u8) -> u8 {
 fn parse_lat_lon(raw: Option<&&str>, hemi: Option<&&str>, degree_digits: usize) -> Option<f32> {
     let raw = *raw?;
     let hemi = *hemi?;
+    if hemi != "N" && hemi != "S" && hemi != "E" && hemi != "W" {
+        return None;
+    }
     if raw.len() < degree_digits + 3 {
         return None;
     }
@@ -448,6 +502,97 @@ fn parse_lat_lon(raw: Option<&&str>, hemi: Option<&&str>, degree_digits: usize) 
         out = -out;
     }
     Some(out)
+}
+
+fn split_nmea_checksum(sentence: &str) -> Option<(&str, bool)> {
+    let star = sentence.rfind('*')?;
+    if star + 3 != sentence.len() {
+        return None;
+    }
+    let payload = &sentence[..star];
+    let expected = u8::from_str_radix(&sentence[star + 1..], 16).ok()?;
+    let calc = payload
+        .as_bytes()
+        .iter()
+        .skip(1) // skip '$'
+        .fold(0u8, |acc, b| acc ^ b);
+    Some((payload, calc == expected))
+}
+
+fn parse_rmc_utc_unix(parts: &[&str]) -> Option<u64> {
+    let time = *parts.get(1)?;
+    let date = *parts.get(9)?;
+    if date.len() < 6 {
+        return None;
+    }
+    let day = date.get(0..2)?.parse::<u32>().ok()?;
+    let month = date.get(2..4)?.parse::<u32>().ok()?;
+    let yy = date.get(4..6)?.parse::<u32>().ok()?;
+    let year = if yy >= 80 {
+        1900 + yy as i32
+    } else {
+        2000 + yy as i32
+    };
+    let (hour, minute, second) = parse_nmea_hms(time)?;
+    unix_from_utc_ymdhms(year, month, day, hour, minute, second)
+}
+
+fn parse_zda_utc_unix(parts: &[&str]) -> Option<u64> {
+    let time = *parts.get(1)?;
+    let day = parts.get(2)?.parse::<u32>().ok()?;
+    let month = parts.get(3)?.parse::<u32>().ok()?;
+    let year = parts.get(4)?.parse::<i32>().ok()?;
+    let (hour, minute, second) = parse_nmea_hms(time)?;
+    unix_from_utc_ymdhms(year, month, day, hour, minute, second)
+}
+
+fn parse_nmea_hms(raw: &str) -> Option<(u32, u32, u32)> {
+    let dot = raw.find('.').unwrap_or(raw.len());
+    if dot < 6 {
+        return None;
+    }
+    let hh = raw.get(0..2)?.parse::<u32>().ok()?;
+    let mm = raw.get(2..4)?.parse::<u32>().ok()?;
+    let ss = raw.get(4..6)?.parse::<u32>().ok()?;
+    if hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    Some((hh, mm, ss))
+}
+
+fn unix_from_utc_ymdhms(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<u64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    Some(
+        (days as u64)
+            .saturating_mul(86_400)
+            .saturating_add((hour as u64) * 3_600)
+            .saturating_add((minute as u64) * 60)
+            .saturating_add(second as u64),
+    )
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    let y = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let d = day as i64;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    if !(0..=365).contains(&doy) {
+        return None;
+    }
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
 }
 
 fn draw_line(panel: sys::esp_lcd_panel_handle_t, y: i32, text: &str) -> Result<()> {

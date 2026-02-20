@@ -11,7 +11,7 @@ fn esp_ok_ctx(code: sys::esp_err_t, ctx: &str) -> Result<()> {
 
 fn wifi_init_cfg_default() -> sys::wifi_init_config_t {
     sys::wifi_init_config_t {
-        osi_funcs: unsafe { &mut sys::g_wifi_osi_funcs },
+        osi_funcs: &raw mut sys::g_wifi_osi_funcs,
         wpa_crypto_funcs: unsafe { sys::g_wifi_default_wpa_crypto_funcs },
         static_rx_buf_num: sys::CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM as i32,
         dynamic_rx_buf_num: sys::CONFIG_ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM as i32,
@@ -444,7 +444,7 @@ pub fn wifi_monitor_start(channel: u8) -> Result<()> {
     unsafe {
         sys::esp_wifi_set_promiscuous_rx_cb(Some(promisc_rx_cb));
         esp_ok_ctx(
-            unsafe { sys::esp_wifi_set_promiscuous(true) },
+            sys::esp_wifi_set_promiscuous(true),
             "esp_wifi_set_promiscuous",
         )?;
         PROMISC_ACTIVE = true;
