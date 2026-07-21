@@ -48,9 +48,16 @@ cargo run
   - UART2 LoRa diagnostic screen for EBYTE E220 modules.
   - Pin mapping on this project: `RX=GPIO18`, `TX=GPIO17`.
   - Sends periodic `ping #NNN` at fixed UART settings (`9600 8N1`).
-  - RF peer profile shown in UI/logging: `915.125 MHz / SF7 / BW125 / CR4/5`.
+  - The UI/logging identifies the unmodified E220-900T22D defaults as
+    `873.125 MHz / Air 2.4 kbit/s` (channel 23 / `0x17`).
+  - The E220 chooses its internal LoRa modulation parameters from the configured
+    air data rate; raw `SF/BW/CR` values and LLCC68 IRQ registers are not exposed
+    through its transparent UART interface.
   - Shows RX stats/hex and console-style TX/RX status lines.
-  - No runtime baud scan and no `C1 C1 C1` config probing (requires wired `M0/M1`).
+  - No runtime baud scan and no register probing (configuration mode and
+    `C1 00 08` register reads require wired `M0/M1`; `AUX` is recommended).
+  - Receiving a transmitted ping requires a second, identically configured E220
+    or another radio peer that sends data back; the module does not echo itself.
 - `SD Format`
   - SD mount + format + write/read `test.txt`.
   - Progress is shown on display in percent (`0%`..`100%`).
@@ -68,6 +75,77 @@ cargo run
 - `LoRa Logging`
   - Separate screen with logging toggle/status.
   - Can keep logging in background while using other screens.
+
+## LoRa / E220 Wiring and Configuration Access
+
+The current LoRa data connection uses UART2 in transparent mode:
+
+| T-HMI | EBYTE E220 | Direction |
+| --- | --- | --- |
+| `GPIO17` (UART2 TX) | `RXD` | T-HMI to E220 |
+| `GPIO18` (UART2 RX) | `TXD` | E220 to T-HMI |
+| `GND` | `GND` | Common ground |
+
+UART TX and RX must be crossed as shown. The firmware uses `9600 8N1`.
+
+### M0/M1 via the free Grove3 connector
+
+Grove3 is free in this project and exposes `GPIO43` and `GPIO44`. These two
+signals can control the E220 operating mode:
+
+| Grove3 / T-HMI | EBYTE E220 |
+| --- | --- |
+| `GPIO43` | `M0` |
+| `GPIO44` | `M1` |
+| `GND` | `GND` |
+| Grove3 supply wire | Leave disconnected and insulate |
+
+Do not connect the Grove3 supply wire to `M0` or `M1`. The E220 mode inputs are
+3.3 V logic signals and must not be driven with 5 V. Verify the signal names and
+wire order against the T-HMI pinout instead of relying only on cable colors.
+
+The matching cable is the **LILYGO Grove Interface Cable, variant P354**, which
+LILYGO lists as compatible with the T-HMI, T-Embed and T-RGB:
+
+- <https://lilygo.cc/products/grove-interface-cable>
+- Select `Grove [P354]`, not `QT/Qwiic to Grove [P351]`.
+- A standard large Seeed Grove cable is not the same T-HMI-side connector.
+
+### E220 operating modes used here
+
+| M1 | M0 | Mode |
+| ---: | ---: | --- |
+| `0` | `0` | Normal / transparent transmission |
+| `1` | `1` | Configuration mode |
+
+At boot, configure `GPIO43` and `GPIO44` as outputs and drive both low. To read
+the E220 configuration:
+
+1. Set `M0=1` and `M1=1`.
+2. Wait for the mode change to complete; waiting for `AUX=HIGH` is recommended.
+3. Send the bytes `C1 00 08` over UART2 at `9600 8N1`.
+4. Read and decode the returned register bytes.
+5. Set `M0=0` and `M1=0` to return to transparent operation.
+
+Example GPIO initialization (not yet implemented in the current firmware):
+
+```rust
+let mut lora_m0 = PinDriver::output(p.pins.gpio43)?;
+let mut lora_m1 = PinDriver::output(p.pins.gpio44)?;
+
+lora_m0.set_low()?;
+lora_m1.set_low()?;
+```
+
+For a one-time manual register read, `M0` and `M1` can instead be switched
+together between `GND` (normal mode) and `3V3` (configuration mode). Always
+switch wiring with power removed. Automated register reads require the GPIO
+control above; an additional connection from E220 `AUX` to a free T-HMI input
+is optional but recommended.
+
+Pins `GPIO11` through `GPIO13` are used by the T-HMI SD-card interface and
+`GPIO19`/`GPIO20` are used by native USB, so they should not be substituted for
+the Grove3 mode-control pins in this project.
 
 ### Header Status Icons
 - Header shows `W` (WiFi) and `H` (HTTPD) status icons on all screens.
