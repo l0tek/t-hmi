@@ -40,7 +40,6 @@ pub struct LoRaTester<'d> {
     cmd_last_hex: String,
     ping_seen: u32,
     last_ping_seq: Option<u16>,
-    rx_line_since_last_tx: bool,
 }
 
 impl<'d> LoRaTester<'d> {
@@ -74,7 +73,6 @@ impl<'d> LoRaTester<'d> {
             cmd_last_hex: String::from("-"),
             ping_seen: 0,
             last_ping_seq: None,
-            rx_line_since_last_tx: false,
         })
     }
 
@@ -91,7 +89,6 @@ impl<'d> LoRaTester<'d> {
         self.cmd_last_hex = String::from("-");
         self.ping_seen = 0;
         self.last_ping_seq = None;
-        self.rx_line_since_last_tx = false;
         self.baud_index = 0;
         let _ = self
             .uart
@@ -110,14 +107,7 @@ impl<'d> LoRaTester<'d> {
                 self.tx_packets = next;
                 self.tx_bytes = self.tx_bytes.saturating_add(written as u32);
                 self.last_tx_ms = now_ms;
-                println!("LoRa TX: ping #{seq:03}");
-                println!("TX done, IRQ=0x08");
-                if self.rx_line_since_last_tx {
-                    println!("LoRa RX done, IRQ=0x40");
-                } else {
-                    println!("LoRa RX timeout/none irq=0x00");
-                }
-                self.rx_line_since_last_tx = false;
+                println!("E220 UART accepted {} bytes: ping #{seq:03}", written);
                 changed = true;
             }
         }
@@ -143,7 +133,6 @@ impl<'d> LoRaTester<'d> {
                     if !self.line_buf.is_empty() {
                         self.rx_lines = self.rx_lines.saturating_add(1);
                         self.last_line = String::from_utf8_lossy(&self.line_buf).to_string();
-                        self.rx_line_since_last_tx = true;
                         if let Some(seq) = parse_ping_seq(&self.last_line) {
                             self.ping_seen = self.ping_seen.saturating_add(1);
                             self.last_ping_seq = Some(seq);
@@ -281,8 +270,8 @@ pub fn draw_lora_test_values(
         36,
         &format!("UART2 RX18 TX17 Baud:{}", lora.current_baud()),
     )?;
-    draw_line(panel, 48, "E220: Normal M0=0 M1=0")?;
-    draw_line(panel, 60, "RF peer: 915.125 SF7 BW125 CR4/5")?;
+    draw_line(panel, 48, "E220 Normal: M1=0 M0=0")?;
+    draw_line(panel, 60, "Default: 873.125MHz Air:2.4k")?;
     draw_line(panel, 72, &format!("TX packets: {}", lora.tx_packets()))?;
     draw_line(panel, 84, &format!("TX bytes:   {}", lora.tx_bytes()))?;
     draw_line(panel, 96, &format!("RX bytes:   {}", lora.rx_bytes()))?;
@@ -318,7 +307,7 @@ pub fn draw_lora_test_values(
             truncate_chars(lora.cmd_probe_hex(), 20)
         ),
     )?;
-    draw_line(panel, 168, "CMD test needs M0=1 M1=1")?;
+    draw_line(panel, 168, "CFG read: M1=1 M0=1, C1 00 08")?;
     draw_line(
         panel,
         180,

@@ -1321,7 +1321,7 @@ impl LoraSdLogger {
         let line = format!(
             "{};{};{};{};{};{};{};{};{};{};{};{};{};{}",
             now_ms,
-            "915.125/SF7/BW125/CR4/5",
+            "E220-default/873.125MHz/Air2.4k",
             lora.current_baud(),
             lora.tx_packets(),
             lora.tx_bytes(),
@@ -1477,7 +1477,7 @@ fn draw_lora_logging_screen(
         178,
         LCD_H_RES,
         12,
-        "RF peer: 915.125 SF7 BW125 CR4/5",
+        "E220 default: 873.125MHz Air 2.4k",
         Rgb565::new(0, 63, 0),
         Rgb565::BLACK,
     )?;
